@@ -16,6 +16,11 @@ REMOTE_ROOT = "/data/smsi-archive"
 FINGERPRINT_RE = re.compile(r"^SHA256:[A-Za-z0-9+/]{43}$")
 HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 USER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
+# A pasted token is the most likely alerting mistake, so its shape is refused
+# here instead of being discovered as a rejected message hours later.
+TELEGRAM_TOKEN_RE = re.compile(r"^\d{6,12}:[A-Za-z0-9_-]{30,64}$")
+TELEGRAM_CHAT_RE = re.compile(r"^(-?\d{1,20}|@[A-Za-z0-9_]{5,32})$")
+ALERT_LEVELS = ("warning", "error")
 
 
 def app_data_dir() -> Path:
@@ -36,6 +41,19 @@ def default_local_root() -> Path:
     return Path.home() / "Documents" / "SMSI-Archive"
 
 
+def validate_alert_token(token: str) -> str:
+    """Check a pasted token's shape before it is encrypted and stored.
+
+    Once protected the blob cannot be inspected, so this is the only chance to
+    catch a truncated paste - otherwise the mistake surfaces hours later as a
+    message Telegram silently refused.
+    """
+    text = str(token or "").strip()
+    if text and not TELEGRAM_TOKEN_RE.fullmatch(text):
+        raise ValueError("Telegram 机器人令牌格式无效，应形如 123456789:AA…")
+    return text
+
+
 @dataclass
 class AppConfig:
     config_version: int = CONFIG_VERSION
@@ -50,6 +68,12 @@ class AppConfig:
     bandwidth_mib: int = 20
     auto_sync_enabled: bool = False
     floating_window_enabled: bool = False
+    alert_enabled: bool = False
+    alert_token_blob: str = ""
+    alert_chat_id: str = ""
+    alert_min_level: str = "warning"
+    alert_stale_hours: int = 6
+    alert_upstream_lag_days: int = 3
 
     def __post_init__(self) -> None:
         if not self.local_root:
@@ -65,6 +89,28 @@ class AppConfig:
 
     def set_password(self, password: str) -> None:
         self.password_blob = protect_password(password) if password else ""
+
+    def alert_token(self) -> str:
+        return unprotect_password(self.alert_token_blob) if self.alert_token_blob else ""
+
+    def set_alert_token(self, token: str) -> None:
+        self.alert_token_blob = protect_password(token) if token else ""
+
+    def _alert_errors(self) -> list[str]:
+        """Validated without decrypting: a damaged token must not block startup."""
+        errors: list[str] = []
+        if self.alert_min_level not in ALERT_LEVELS:
+            errors.append("告警级别必须是 warning 或 error")
+        if not 1 <= int(self.alert_stale_hours) <= 168:
+            errors.append("无成功扫描告警阈值必须为 1 至 168 小时")
+        if not 2 <= int(self.alert_upstream_lag_days) <= 14:
+            errors.append("数据源停更告警阈值必须为 2 至 14 天")
+        chat_id = self.alert_chat_id.strip()
+        if chat_id and not TELEGRAM_CHAT_RE.fullmatch(chat_id):
+            errors.append("Telegram 会话 ID 无效")
+        if self.alert_enabled and not (self.alert_token_blob and chat_id):
+            errors.append("启用告警前必须填写机器人令牌与会话 ID")
+        return errors
 
     def validate(self, *, require_connection: bool = True) -> list[str]:
         errors: list[str] = []
@@ -94,6 +140,7 @@ class AppConfig:
             errors.append("同步并发必须为 1 至 4")
         if int(self.bandwidth_mib) not in {0, 5, 10, 20, 50}:
             errors.append("总带宽限制无效")
+        errors.extend(self._alert_errors())
         return errors
 
     def to_dict(self) -> dict[str, Any]:
@@ -115,6 +162,12 @@ class AppConfig:
             bandwidth_mib=bandwidth,
             auto_sync_enabled=bool(value.get("auto_sync_enabled", False)),
             floating_window_enabled=bool(value.get("floating_window_enabled", False)),
+            alert_enabled=bool(value.get("alert_enabled", False)),
+            alert_token_blob=str(value.get("alert_token_blob") or "").strip(),
+            alert_chat_id=str(value.get("alert_chat_id") or "").strip(),
+            alert_min_level=str(value.get("alert_min_level") or "warning").strip(),
+            alert_stale_hours=int(value.get("alert_stale_hours") or 6),
+            alert_upstream_lag_days=int(value.get("alert_upstream_lag_days") or 3),
         )
 
 

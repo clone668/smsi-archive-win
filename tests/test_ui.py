@@ -277,6 +277,43 @@ def test_continuity_and_automatic_sync_scope() -> None:
     }
 
 
+def test_saving_settings_keeps_the_stored_alert_token_and_wakes_alerting(
+    tmp_path, monkeypatch
+) -> None:
+    """The token is the one setting a careless save could silently destroy."""
+    token = "123456789:AAEabcdefghijklmnopqrstuvwxyz0123456"
+    app = QApplication.instance() or QApplication([])
+    store = ConfigStore(tmp_path / "config")
+    config = store.load()
+    config.set_alert_token(token)
+    config.alert_chat_id = "-1001234567890"
+    config.alert_enabled = True
+    store.save(config)
+    window = MainWindow(store, StateStore(tmp_path / "state"), QIcon())
+    app.processEvents()
+
+    assert window.alert_enabled_input.currentData() is True
+    assert window.alert_chat_input.text() == "-1001234567890"
+    # Never shown back, so an empty box has to mean "keep the saved one".
+    assert window.alert_token_input.text() == ""
+
+    woke: list[bool] = []
+    monkeypatch.setattr(window.alert_worker, "wake", lambda: woke.append(True))
+    window.alert_stale_input.setValue(12)
+    window.save_settings()
+
+    saved = store.load()
+    assert saved.alert_token() == token
+    assert saved.alert_stale_hours == 12
+    # A new threshold that waits for the next poll interval is a new threshold
+    # the user does not yet have.
+    assert woke == [True]
+    assert "已启用" in window.alert_health_label.text()
+
+    window._exit_requested = True
+    window.close()
+
+
 def test_tray_actions_follow_window_and_sync_state(tmp_path, monkeypatch) -> None:
     app = QApplication.instance() or QApplication([])
     window = MainWindow(

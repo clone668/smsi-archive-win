@@ -36,7 +36,8 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
-from .config import AppConfig, ConfigStore, REMOTE_ROOT
+from .alerts import AlertNotifier, AlertWorker
+from .config import ALERT_LEVELS, AppConfig, ConfigStore, REMOTE_ROOT, validate_alert_token
 from .icons import ACCENT_COLOR, ICON_COLOR, SUCCESS_COLOR, lucide_icon
 from .models import ArchiveCatalog, ArchiveDay, RemoteObject, STATUS_LABELS
 from .remote import HostKeyRequired, RemoteArchiveClient
@@ -170,6 +171,7 @@ class UiSignals(QObject):
     operation_done = Signal(str, object)
     operation_error = Signal(str, str)
     host_key_required = Signal(str, str)
+    alert_test_done = Signal(bool, str)
 
 
 class TreeProgressWidget(QWidget):
@@ -344,6 +346,10 @@ class MainWindow(QMainWindow):
         self.auto_sync_timer = QTimer(self)
         self.auto_sync_timer.setInterval(15 * 60 * 1000)
         self.auto_sync_timer.timeout.connect(self._auto_sync_tick)
+        self.notifier = AlertNotifier(config_store, state_store)
+        # Alerting runs on its own thread and is started unconditionally: with
+        # notifications off each pass costs one config read and stops there.
+        self.alert_worker = AlertWorker(self.notifier)
         self.setWindowIcon(icon)
         self.setWindowTitle("SMSI 归档同步")
         self.setMinimumSize(1040, 680)
@@ -359,6 +365,7 @@ class MainWindow(QMainWindow):
         self._update_floating_idle_state()
         if self.config.auto_sync_enabled:
             self.auto_sync_timer.start()
+        self.alert_worker.start()
         QTimer.singleShot(0, self._load_cached_catalog_async)
 
     def _center_window(self) -> None:
@@ -782,6 +789,7 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(self._connection_section())
         content_layout.addWidget(self._storage_section())
         content_layout.addWidget(self._transfer_section())
+        content_layout.addWidget(self._alert_section())
         content_layout.addStretch(1)
         scroll.setWidget(content)
         scroll.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
@@ -877,6 +885,57 @@ class MainWindow(QMainWindow):
         layout.addLayout(form)
         return frame
 
+    def _alert_section(self) -> QWidget:
+        frame, layout = self._section(
+            "告警通知", "窗口最小化时，失败与停更通过 Telegram 主动通知"
+        )
+        form = QFormLayout()
+        form.setHorizontalSpacing(18)
+        form.setVerticalSpacing(9)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.alert_enabled_input = QComboBox()
+        self.alert_enabled_input.setFixedWidth(160)
+        self.alert_enabled_input.addItem("关闭", False)
+        self.alert_enabled_input.addItem("开启", True)
+        self.alert_token_input = QLineEdit()
+        self.alert_token_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.alert_token_input.setPlaceholderText("留空表示不修改已保存的令牌")
+        self.alert_chat_input = QLineEdit()
+        self.alert_chat_input.setPlaceholderText("例如 -1001234567890")
+        self.alert_level_input = QComboBox()
+        self.alert_level_input.setFixedWidth(160)
+        self.alert_level_input.addItem("警告及以上", "warning")
+        self.alert_level_input.addItem("仅错误", "error")
+        self.alert_stale_input = QSpinBox()
+        self.alert_stale_input.setRange(1, 168)
+        self.alert_stale_input.setSuffix(" 小时")
+        self.alert_stale_input.setFixedWidth(126)
+        self.alert_lag_input = QSpinBox()
+        self.alert_lag_input.setRange(2, 14)
+        self.alert_lag_input.setSuffix(" 天")
+        self.alert_lag_input.setFixedWidth(126)
+        self.alert_test_button = QPushButton("发送测试消息")
+        self.alert_test_button.setIcon(lucide_icon("send", ACCENT_COLOR))
+        test_row = QWidget()
+        test_layout = QHBoxLayout(test_row)
+        test_layout.setContentsMargins(0, 0, 0, 0)
+        test_layout.addWidget(self.alert_test_button)
+        test_layout.addStretch(1)
+        form.addRow("告警通知", self.alert_enabled_input)
+        form.addRow("机器人令牌", self.alert_token_input)
+        form.addRow("会话 ID", self.alert_chat_input)
+        form.addRow("推送级别", self.alert_level_input)
+        form.addRow("扫描中断", self.alert_stale_input)
+        form.addRow("数据源停更", self.alert_lag_input)
+        form.addRow("", test_row)
+        layout.addLayout(form)
+        self.alert_health_label = QLabel()
+        self.alert_health_label.setObjectName("sectionDescription")
+        self.alert_health_label.setWordWrap(True)
+        layout.addWidget(self.alert_health_label)
+        return frame
+
     def _connect_signals(self) -> None:
         self.refresh_button.clicked.connect(self.start_scan)
         self.sync_button.clicked.connect(self.start_sync)
@@ -884,6 +943,8 @@ class MainWindow(QMainWindow):
         self.cancel_button.clicked.connect(self.cancel_current_operation)
         self.save_button.clicked.connect(self.save_settings)
         self.test_button.clicked.connect(self.test_connection)
+        self.alert_test_button.clicked.connect(self.send_alert_test)
+        self.signals.alert_test_done.connect(self._on_alert_test_done)
         self.tree.itemSelectionChanged.connect(self._update_action_state)
         self.tree.itemExpanded.connect(self._on_tree_item_expanded)
         self.tree.itemDoubleClicked.connect(self._show_item_detail)
@@ -907,6 +968,38 @@ class MainWindow(QMainWindow):
         self.workers_input.setValue(config.download_workers)
         index = self.bandwidth_input.findData(config.bandwidth_mib)
         self.bandwidth_input.setCurrentIndex(max(0, index))
+        self.alert_enabled_input.setCurrentIndex(
+            max(0, self.alert_enabled_input.findData(bool(config.alert_enabled)))
+        )
+        # The stored token is never loaded back into the field: an empty box
+        # means "keep it", so a save of unrelated settings cannot wipe it.
+        self.alert_token_input.clear()
+        self.alert_chat_input.setText(config.alert_chat_id)
+        level = config.alert_min_level if config.alert_min_level in ALERT_LEVELS else "warning"
+        self.alert_level_input.setCurrentIndex(max(0, self.alert_level_input.findData(level)))
+        self.alert_stale_input.setValue(int(config.alert_stale_hours))
+        self.alert_lag_input.setValue(int(config.alert_upstream_lag_days))
+        self._render_alert_health(config)
+
+    def _render_alert_health(self, config: AppConfig) -> None:
+        if not config.alert_enabled:
+            self.alert_health_label.setText("告警通知未启用，失败只能在本窗口看到。")
+            return
+        health = self.notifier.state()
+        parts: list[str] = []
+        if health["last_error"]:
+            parts.append(f"最近一次发送失败：{health['last_error']}")
+        elif health["last_sent_at"]:
+            parts.append(f"最近推送 {timestamp_text(health['last_sent_at'])}")
+        else:
+            parts.append("已启用，暂无需要推送的内容")
+        if health["scan_alerted"]:
+            parts.append("当前处于「扫描中断」告警状态")
+        if health["upstream_alerted"]:
+            parts.append("当前处于「数据源停更」告警状态")
+        if health["pending_events"]:
+            parts.append("仍有待推送内容")
+        self.alert_health_label.setText("；".join(parts) + "。")
 
     def _form_config(self) -> AppConfig:
         config = AppConfig(
@@ -921,8 +1014,17 @@ class MainWindow(QMainWindow):
             bandwidth_mib=int(self.bandwidth_input.currentData()),
             auto_sync_enabled=self.config.auto_sync_enabled,
             floating_window_enabled=self.config.floating_window_enabled,
+            alert_enabled=bool(self.alert_enabled_input.currentData()),
+            alert_token_blob=self.config.alert_token_blob,
+            alert_chat_id=self.alert_chat_input.text().strip(),
+            alert_min_level=str(self.alert_level_input.currentData()),
+            alert_stale_hours=self.alert_stale_input.value(),
+            alert_upstream_lag_days=self.alert_lag_input.value(),
         )
         config.set_password(self.password_input.text())
+        token = validate_alert_token(self.alert_token_input.text())
+        if token:
+            config.set_alert_token(token)
         return config
 
     def _choose_local_root(self) -> None:
@@ -938,10 +1040,37 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "设置未保存", str(exc))
             return
         self.config = config
+        self.alert_token_input.clear()
+        self._render_alert_health(config)
+        # An alert setting is useless if it waits for the next poll interval.
+        self.alert_worker.wake()
         self.statusBar().showMessage("设置已保存", 5000)
         self._set_page(0)
         if not config.validate(require_connection=True):
             self.start_scan()
+
+    def send_alert_test(self) -> None:
+        """Prove the channel from the settings page, off the UI thread."""
+        self.alert_test_button.setEnabled(False)
+
+        def work() -> None:
+            try:
+                self.notifier.send_test()
+            except (RuntimeError, OSError) as exc:
+                self.signals.alert_test_done.emit(False, str(exc)[:300])
+            else:
+                self.signals.alert_test_done.emit(True, "")
+
+        threading.Thread(target=work, name="smsi-alert-test", daemon=True).start()
+
+    def _on_alert_test_done(self, ok: bool, message: str) -> None:
+        self.alert_test_button.setEnabled(True)
+        self._render_alert_health(self.config)
+        if ok:
+            self.statusBar().showMessage("测试消息已发送，请查看 Telegram", 6000)
+            QMessageBox.information(self, "测试消息已发送", "请在 Telegram 中确认收到消息。")
+        else:
+            QMessageBox.warning(self, "测试消息发送失败", message)
 
     def _start_background(self, operation: str, target: Callable[[], Any]) -> bool:
         if self.busy_operation:
@@ -1272,6 +1401,11 @@ class MainWindow(QMainWindow):
         def save() -> None:
             try:
                 self.state_store.save_catalog(catalog)
+                # Both time-based alarms measure this: when the last successful
+                # scan happened, and the newest archive day it found.
+                self.notifier.record_scan(
+                    catalog.scanned_at, [day.archive_date for day in catalog.days]
+                )
             except Exception:
                 LOGGER.exception("Unable to persist catalog cache")
 
@@ -1635,6 +1769,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         if self._exit_requested:
+            self.alert_worker.stop()
             self.floating_window.close()
             event.accept()
             return
@@ -1654,6 +1789,7 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             self.cancel_event.set()
+        self.alert_worker.stop()
         self.floating_window.close()
         event.accept()
 
