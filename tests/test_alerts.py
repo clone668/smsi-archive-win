@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from smsi_archive_sync.alerts import AlertNotifier, _scrub, archive_watch_record
+from smsi_archive_sync.alerts import (
+    MAX_EVENTS_PER_MESSAGE,
+    AlertNotifier,
+    _scrub,
+    archive_watch_record,
+)
 from smsi_archive_sync.config import ConfigStore, validate_alert_token
 from smsi_archive_sync.state import StateStore
 
@@ -231,6 +236,54 @@ def test_a_broken_channel_is_recorded_locally_once_per_reason(tmp_path: Path) ->
     assert len(notes) == 1
     # Recorded at info level so it can never be forwarded as an alert itself.
     assert notes[0]["level"] == "info"
+
+
+def test_a_repeated_fault_is_reported_once_with_the_count_of_its_repeats(
+    tmp_path: Path,
+) -> None:
+    """Automatic sync retries every 15 minutes; one fault is still one fault."""
+    _store, state, notifier, sender, clock = _build(tmp_path)
+    notifier.poll()
+    state.event("error", "操作失败", detail="连接超时")
+    assert notifier.poll()["events"] == 1
+
+    for attempt in range(3):
+        clock["now"] += timedelta(minutes=15)
+        state.event("error", "操作失败", detail=f"第 {attempt} 次重试仍然超时")
+        result = notifier.poll()
+        assert result["skipped"] == "repeats_suppressed"
+        assert result["suppressed"] == 1
+    assert len(sender.messages) == 1
+
+    # A different fault is news and is never held back by the suppressed one.
+    state.event("error", "磁盘空间不足", detail="可用 1 GiB")
+    assert notifier.poll()["events"] == 1
+    assert "磁盘空间不足" in sender.messages[1]
+    assert "操作失败" not in sender.messages[1]
+
+    clock["now"] += timedelta(minutes=30)
+    state.event("error", "操作失败", detail="仍然连接超时")
+    assert notifier.poll()["events"] == 1
+    assert "操作失败（期间重复 3 次）" in sender.messages[2]
+
+
+def test_suppressed_repeats_never_hide_a_fault_further_down_the_list(
+    tmp_path: Path,
+) -> None:
+    """The cursor may pass repeats, never events this pass has not read."""
+    _store, state, notifier, sender, _clock = _build(tmp_path)
+    notifier.poll()
+    state.event("error", "操作失败")
+    assert notifier.poll()["events"] == 1
+
+    for _ in range(MAX_EVENTS_PER_MESSAGE):
+        state.event("error", "操作失败")
+    state.event("error", "校验失败", detail="sha256 不一致")
+
+    assert notifier.poll()["skipped"] == "repeats_suppressed"
+    assert notifier.state()["pending_events"] is True
+    assert notifier.poll()["events"] == 1
+    assert "校验失败" in sender.messages[1]
 
 
 def test_disabled_alerting_sends_nothing(tmp_path: Path) -> None:
