@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint
-from PySide6.QtGui import QAction, QIcon
-from PySide6.QtWidgets import QApplication, QFrame
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtGui import QAction, QFontMetrics, QIcon
+from PySide6.QtWidgets import (
+    QApplication,
+    QFormLayout,
+    QFrame,
+    QLabel,
+    QStyle,
+    QStyleOptionFrame,
+)
 
 from smsi_archive_sync.config import ConfigStore
 from smsi_archive_sync.models import ArchiveCatalog, ArchiveDay, ArchiveSummary, RemoteObject
@@ -16,8 +23,10 @@ from smsi_archive_sync.style import APP_STYLE
 from smsi_archive_sync.ui import (
     MainWindow,
     TreeProgressWidget,
+    age_text,
     archive_continuity,
     automatic_sync_days,
+    compact_count,
     timestamp_text,
 )
 
@@ -361,3 +370,205 @@ def test_tray_actions_follow_window_and_sync_state(tmp_path, monkeypatch) -> Non
     assert len(menu_positions) == 1
     window._exit_requested = True
     window.close()
+
+
+def _shown_window(tmp_path, page: int = 0):
+    """A styled, shown window: every layout invariant below depends on the QSS."""
+    app = QApplication.instance() or QApplication([])
+    app.setStyle("Fusion")
+    app.setStyleSheet(APP_STYLE)
+    window = MainWindow(
+        ConfigStore(tmp_path / "config"),
+        StateStore(tmp_path / "state"),
+        QIcon(),
+    )
+    window.show()
+    window._set_page(page)
+    app.processEvents()
+    return app, window
+
+
+def test_tree_header_never_clips_its_own_headings(tmp_path) -> None:
+    """A pinned width has to be at least as wide as the word it must show.
+
+    Two of the seven were not, and "Ubuntu 状态" reached the user as
+    "Ubuntu 状".  The assertion is the invariant rather than the pinned numbers:
+    the heading plus the 8px of section padding on each side has to fit.
+    """
+    _app, window = _shown_window(tmp_path)
+    header = window.tree.header()
+    header.ensurePolished()
+    metrics = QFontMetrics(header.font())
+    for column in range(window.tree.columnCount()):
+        heading = window.tree.headerItem().text(column)
+        assert header.sectionSize(column) >= metrics.horizontalAdvance(heading) + 16, heading
+    # The name column holds the unbounded content, so it takes the spare width.
+    # Letting the last section stretch instead silently voids its pinned width.
+    assert header.stretchLastSection() is False
+    window._exit_requested = True
+    window.close()
+
+
+def _first_fields(window) -> list[tuple[str, int]]:
+    """The first input of every settings card, with the card's own title."""
+    rows = []
+    for frame in window.findChildren(QFrame, "settingsSection"):
+        form = frame.findChildren(QFormLayout)[0]
+        title = frame.findChildren(QLabel)[0].text()
+        rows.append((title, form.itemAt(0, QFormLayout.ItemRole.FieldRole).widget().x()))
+    return rows
+
+
+def test_settings_cards_share_one_label_column(tmp_path) -> None:
+    """Four cards, one vertical line for the inputs to start on.
+
+    A form layout measures its label column from its own longest label, so the
+    card whose labels were shortest put its boxes tens of pixels left of the
+    card underneath it.
+    """
+    _app, window = _shown_window(tmp_path, page=1)
+    rows = _first_fields(window)
+    assert len(rows) >= 4
+    assert len({x for _title, x in rows}) == 1, rows
+    window._exit_requested = True
+    window.close()
+
+
+def test_every_settings_field_is_the_same_height(tmp_path) -> None:
+    """A spin box asks for 3px more than a line edit and has to be capped.
+
+    Styling the box without capping it left 端口 and 磁盘保留空间 standing taller
+    than every other row on the page.
+    """
+    _app, window = _shown_window(tmp_path, page=1)
+    heights = {
+        "host": window.host_input.height(),
+        "port": window.port_input.height(),
+        "reserve": window.reserve_input.height(),
+        "bandwidth": window.bandwidth_input.height(),
+    }
+    assert len(set(heights.values())) == 1, heights
+    window._exit_requested = True
+    window.close()
+
+
+def test_keyboard_focus_costs_no_geometry(tmp_path) -> None:
+    """The accent ring is two pixels the layout must not pay for.
+
+    A focus border that is not compensated in padding and min-height grows the
+    widget, which pushes the form row taller and steps the text sideways - so
+    tabbing through the page makes it twitch.
+    """
+    app, window = _shown_window(tmp_path, page=1)
+    for name in ("host_input", "port_input", "bandwidth_input", "save_button"):
+        widget = getattr(window, name)
+        before = (widget.geometry(), widget.sizeHint())
+        widget.setFocus(Qt.FocusReason.TabFocusReason)
+        app.processEvents()
+        assert (widget.geometry(), widget.sizeHint()) == before, name
+        widget.clearFocus()
+        app.processEvents()
+
+    def text_origin() -> int:
+        option = QStyleOptionFrame()
+        option.initFrom(window.host_input)
+        return window.host_input.style().subElementRect(
+            QStyle.SubElement.SE_LineEditContents, option, window.host_input
+        ).x()
+
+    unfocused = text_origin()
+    window.host_input.setFocus(Qt.FocusReason.TabFocusReason)
+    app.processEvents()
+    assert text_origin() == unfocused
+    window._exit_requested = True
+    window.close()
+
+
+def test_status_bar_reports_auto_sync_instead_of_the_task_band(tmp_path) -> None:
+    """The bar used to repeat the sentence already on screen two rows above.
+
+    Whether unattended syncing is armed was shown nowhere in the window, only in
+    the tray menu, so that is what earns the permanent slot.
+    """
+    _app, window = _shown_window(tmp_path)
+    window.config.auto_sync_enabled = True
+    window._update_auto_sync_chip()
+    assert window.auto_sync_chip.property("state") == "on"
+    assert "已开启" in window.auto_sync_chip.text()
+    window.config.auto_sync_enabled = False
+    window._update_auto_sync_chip()
+    assert window.auto_sync_chip.property("state") == "off"
+    window._exit_requested = True
+    window.close()
+
+
+def test_unconfigured_client_says_so_once(tmp_path) -> None:
+    """Not twice, and not in a message that never times out."""
+    _app, window = _shown_window(tmp_path)
+    window._on_cached_catalog_ready(None)
+    assert window.task_detail.text() == "请先在设置中完成 Ubuntu 连接"
+    assert window.statusBar().currentMessage() == ""
+    window._exit_requested = True
+    window.close()
+
+
+def test_finished_progress_clears_only_while_idle(tmp_path) -> None:
+    """A bar left at 100% reads as a task about to finish, hours after one did.
+
+    It clears a moment after the task ends - but only if nothing has started in
+    the meantime, so the rescan that follows a sync is never zeroed out from
+    under itself.
+    """
+    _app, window = _shown_window(tmp_path)
+    window.task_progress.setValue(1000)
+    window.busy_operation = ""
+    window._clear_finished_progress()
+    assert window.task_progress.value() == 0
+
+    window.task_progress.setValue(400)
+    window.busy_operation = "sync"
+    window._clear_finished_progress()
+    assert window.task_progress.value() == 400
+    window.busy_operation = ""
+    window._exit_requested = True
+    window.close()
+
+
+def test_compact_count_keeps_a_column_of_magnitudes_aligned() -> None:
+    """Stripping the trailing zero printed 1.7M directly above 1.58M."""
+    assert compact_count(1_700_000) == "1.70M"
+    assert compact_count(1_584_912) == "1.58M"
+    assert compact_count(12_345_678) == "12.3M"
+    assert compact_count(999) == "999"
+    assert compact_count(None) == "0"
+
+
+def test_scan_age_answers_the_question_that_was_asked() -> None:
+    """How long ago, not when: the reader wants to know if it is still scanning.
+
+    A full UTC stamp was three times the width of every other reading in the
+    strip and still needed a subtraction in the reader's head on a UTC+08 box.
+    """
+    now = datetime.now(timezone.utc)
+    assert age_text(now.isoformat()) == "刚刚"
+    assert age_text((now - timedelta(minutes=7)).isoformat()) == "7 分钟前"
+    assert age_text((now - timedelta(hours=5)).isoformat()) == "5 小时前"
+    assert age_text((now - timedelta(days=3)).isoformat()) == "3 天前"
+    assert age_text("") == "--"
+    # A stamp Qt cannot parse is still worth showing verbatim.
+    assert age_text("不是时间") == "不是时间"
+
+
+def test_scan_age_keeps_the_exact_stamp_on_the_tooltip(tmp_path) -> None:
+    """The reading is relative; the stamp it was derived from stays reachable."""
+    _app, window = _shown_window(tmp_path)
+    window.catalog = ArchiveCatalog(days=[], scanned_at="2026-09-05T22:25:42.123456Z")
+    window._refresh_scan_age()
+    assert window.last_scan_label.text() != "2026-09-05 22:25:42 UTC"
+    assert "2026-09-05 22:25:42 UTC" in window.last_scan_label.toolTip()
+    window._exit_requested = True
+    window.close()
+
+
+
+

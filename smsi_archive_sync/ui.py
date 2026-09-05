@@ -8,7 +8,7 @@ from pathlib import PurePosixPath
 from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QPoint, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QIcon
+from PySide6.QtGui import QAction, QColor, QFontMetrics, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -51,6 +51,13 @@ LOGGER = logging.getLogger(__name__)
 NODE_ROLE = Qt.ItemDataRole.UserRole
 AUTO_SYNC_LOOKBACK_DAYS = 7
 DANGER_COLOR = "#b42318"
+# Longest label on the settings page.  All four cards measure one shared label
+# column from it, so their input boxes start on the same vertical line instead
+# of each card sizing a column from its own longest label.
+FORM_LABEL_SAMPLE = "本地归档目录"
+# Operations that actually run a task.  "startup" only disables the buttons
+# while the cached catalogue loads and never drives the progress bar.
+RUNNING_OPERATIONS = frozenset({"scan", "auto_scan", "sync", "auto_sync", "verify", "test"})
 
 
 def duration_text(value: Any) -> str:
@@ -79,12 +86,43 @@ def timestamp_text(value: Any) -> str:
     return observed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def age_text(value: Any) -> str:
+    """How long ago, not when.
+
+    A full UTC stamp was the widest value in the summary bar - three times the
+    width of every other one - and it still needed a subtraction in the reader's
+    head, on a machine whose own clock runs at UTC+08, to answer the only
+    question being asked of it: is this thing still scanning.  The exact stamp
+    stays on the tooltip.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return "--"
+    try:
+        observed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=timezone.utc)
+    seconds = int((datetime.now(timezone.utc) - observed).total_seconds())
+    if seconds < 60:
+        return "刚刚"
+    if seconds < 3600:
+        return f"{seconds // 60} 分钟前"
+    if seconds < 86_400:
+        return f"{seconds // 3600} 小时前"
+    return f"{seconds // 86_400} 天前"
+
+
 def compact_count(value: Any) -> str:
     number = max(0, int(value or 0))
     for divisor, suffix in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")):
         if number >= divisor:
+            # Keep the trailing zero.  Stripping it printed 1.7M next to 1.58M
+            # in the same column, so the digits of one magnitude stopped lining
+            # up with each other.
             precision = 2 if number < divisor * 10 else 1
-            return f"{number / divisor:.{precision}f}".rstrip("0").rstrip(".") + suffix
+            return f"{number / divisor:.{precision}f}" + suffix
     return str(number)
 
 
@@ -320,6 +358,7 @@ class MainWindow(QMainWindow):
         self.icon = icon
         self._tree_day_items: dict[str, QTreeWidgetItem] = {}
         self._tree_file_items: dict[tuple[str, str], QTreeWidgetItem] = {}
+        self._form_labels: list[QLabel] = []
         self._exit_requested = False
         self._tray_notice_shown = False
         self.tray_icon: QSystemTrayIcon | None = None
@@ -337,6 +376,11 @@ class MainWindow(QMainWindow):
         self.auto_sync_timer = QTimer(self)
         self.auto_sync_timer.setInterval(15 * 60 * 1000)
         self.auto_sync_timer.timeout.connect(self._auto_sync_tick)
+        # "3 分钟前" that never ticks becomes a lie, and the longer it stays on
+        # screen the bigger the lie gets.  One label, once a minute.
+        self.scan_age_timer = QTimer(self)
+        self.scan_age_timer.setInterval(60 * 1000)
+        self.scan_age_timer.timeout.connect(self._refresh_scan_age)
         self.notifier = AlertNotifier(config_store, state_store)
         # Alerting runs on its own thread and is started unconditionally: with
         # notifications off each pass costs one config read and stops there.
@@ -356,6 +400,7 @@ class MainWindow(QMainWindow):
         self._update_floating_idle_state()
         if self.config.auto_sync_enabled:
             self.auto_sync_timer.start()
+        self.scan_age_timer.start()
         self.alert_worker.start()
         QTimer.singleShot(0, self._load_cached_catalog_async)
 
@@ -380,6 +425,28 @@ class MainWindow(QMainWindow):
         outer.addWidget(self.pages, 1)
         self.setCentralWidget(root)
         self.statusBar().setSizeGripEnabled(False)
+        # The bar used to repeat the task title that the band two rows above it
+        # was already showing.  Whether unattended syncing is armed is shown
+        # nowhere else in the window - only in the tray menu - so that is what
+        # earns the permanent slot.
+        self.auto_sync_chip = QLabel()
+        self.auto_sync_chip.setObjectName("statusChip")
+        self.statusBar().addPermanentWidget(self.auto_sync_chip)
+        self._update_auto_sync_chip()
+
+    def _update_auto_sync_chip(self) -> None:
+        enabled = bool(self.config.auto_sync_enabled)
+        self.auto_sync_chip.setText(
+            "自动同步 已开启" if enabled else "自动同步 已关闭"
+        )
+        self.auto_sync_chip.setProperty("state", "on" if enabled else "off")
+        self.auto_sync_chip.setToolTip(
+            "每 15 分钟检查一次 Ubuntu 并同步可用归档；可在托盘菜单切换"
+            if enabled else
+            "只有手动点击才会扫描或同步；可在托盘菜单开启"
+        )
+        self.auto_sync_chip.style().unpolish(self.auto_sync_chip)
+        self.auto_sync_chip.style().polish(self.auto_sync_chip)
 
     def _build_tray(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -494,6 +561,7 @@ class MainWindow(QMainWindow):
 
     def _update_tray_state(self) -> None:
         configured = not self.config.validate(require_connection=True)
+        self._update_auto_sync_chip()
         if self.show_window_action is not None:
             self.show_window_action.setEnabled(not self.isVisible())
         if self.auto_sync_action is not None:
@@ -561,7 +629,6 @@ class MainWindow(QMainWindow):
             self.connection_label.setText("需要完成连接设置")
             self.task_title.setText("准备就绪")
             self.task_detail.setText("请先在设置中完成 Ubuntu 连接")
-            self.statusBar().showMessage("请先在设置中完成 Ubuntu 连接")
 
     def _exit_from_tray(self) -> None:
         if self.busy_operation in {"sync", "auto_sync", "verify"}:
@@ -672,10 +739,28 @@ class MainWindow(QMainWindow):
         self.tree.setIconSize(QSize(18, 18))
         header_view = self.tree.header()
         header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        # The last column is a fixed-shape sentence, the name column is the one
+        # that grows without limit, so let the name take the spare width.
+        header_view.setStretchLastSection(False)
         column_widths = {1: 86, 2: 90, 3: 90, 4: 70, 5: 122, 6: 220}
+        # A pinned width is a bet that the heading fits inside it, and two of
+        # these lost it: "Ubuntu 状态" rendered as "Ubuntu 状".  Measure the
+        # heading and keep the wider of the two, so a font or a display scale
+        # the numbers were never chosen for cannot cut a column title in half.
+        #
+        # Polish first.  A fresh header still carries the 9pt default font, and
+        # the stylesheet's 10pt only arrives with the polish, so measuring too
+        # early asks the wrong font and comes back 10% short - which is how much
+        # of the heading then went missing.
+        header_view.ensurePolished()
+        metrics = QFontMetrics(header_view.font())
         for column, width in column_widths.items():
+            heading = self.tree.headerItem().text(column)
+            # 8px of section padding on each side, 1px separator, and the
+            # headings are drawn semi-bold while the metrics are not.
+            needed = int(metrics.horizontalAdvance(heading) * 1.08) + 18
             header_view.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
-            header_view.resizeSection(column, width)
+            header_view.resizeSection(column, max(width, needed))
         header_view.setMinimumSectionSize(64)
         layout.addWidget(self.tree, 1)
         layout.addWidget(self._build_task_bar())
@@ -686,7 +771,10 @@ class MainWindow(QMainWindow):
         frame.setObjectName("summaryBar")
         layout = QHBoxLayout(frame)
         layout.setContentsMargins(14, 11, 14, 11)
-        layout.setSpacing(14)
+        # Eight readings and seven dividers: at 14px every gap, the spacing alone
+        # was a fifth of the bar and the strip could not fit inside the window's
+        # own minimum width.
+        layout.setSpacing(12)
         self.connection_label = self._metric(layout, "连接", "未检查", 104)
         self._metric_divider(layout)
         self.ready_label = self._metric(layout, "可同步日期", "0", 76)
@@ -701,7 +789,7 @@ class MainWindow(QMainWindow):
         self._metric_divider(layout)
         self.gap_label = self._metric(layout, "日期缺口", "0", 72)
         self._metric_divider(layout)
-        self.last_scan_label = self._metric(layout, "最近扫描", "--", 190)
+        self.last_scan_label = self._metric(layout, "最近扫描", "--", 104)
         layout.addStretch(1)
         return frame
 
@@ -784,10 +872,42 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(self._transfer_section())
         content_layout.addWidget(self._alert_section())
         content_layout.addStretch(1)
+        self._align_form_labels()
         scroll.setWidget(content)
         scroll.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         outer.addWidget(scroll, 1)
         return page
+
+    def _settings_form(self) -> QFormLayout:
+        form = QFormLayout()
+        form.setHorizontalSpacing(18)
+        form.setVerticalSpacing(9)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        return form
+
+    def _form_row(self, form: QFormLayout, text: str, field: QWidget) -> None:
+        label = QLabel(text)
+        label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._form_labels.append(label)
+        form.addRow(label, field)
+
+    def _align_form_labels(self) -> None:
+        """One label column for the whole page, not one per card.
+
+        A form layout sizes its label column from its own longest label, so the
+        card whose longest label was three characters put its inputs 26px left
+        of the card below it.  Measured after polishing because the point size
+        arrives with the stylesheet, not with the widget.
+        """
+        for label in self._form_labels:
+            label.ensurePolished()
+        widest = max(
+            [label.sizeHint().width() for label in self._form_labels]
+            + [QFontMetrics(self.font()).horizontalAdvance(FORM_LABEL_SAMPLE)]
+        )
+        for label in self._form_labels:
+            label.setMinimumWidth(widest)
 
     def _section(self, title: str, description: str) -> tuple[QFrame, QVBoxLayout]:
         frame = QFrame()
@@ -805,11 +925,7 @@ class MainWindow(QMainWindow):
 
     def _connection_section(self) -> QWidget:
         frame, layout = self._section("Ubuntu 连接", "只读 SSH 连接，主机指纹确认后才允许同步")
-        form = QFormLayout()
-        form.setHorizontalSpacing(18)
-        form.setVerticalSpacing(9)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form = self._settings_form()
         self.host_input = QLineEdit()
         self.port_input = QSpinBox()
         self.port_input.setRange(1, 65535)
@@ -831,11 +947,11 @@ class MainWindow(QMainWindow):
         server_layout.addWidget(self.host_input, 1)
         server_layout.addWidget(port_label)
         server_layout.addWidget(self.port_input)
-        form.addRow("服务器地址", server_row)
-        form.addRow("用户名", self.username_input)
-        form.addRow("SSH 密码", self.password_input)
-        form.addRow("主机指纹", self.fingerprint_input)
-        form.addRow("远端目录", self.remote_root_input)
+        self._form_row(form, "服务器地址", server_row)
+        self._form_row(form, "用户名", self.username_input)
+        self._form_row(form, "SSH 密码", self.password_input)
+        self._form_row(form, "主机指纹", self.fingerprint_input)
+        self._form_row(form, "远端目录", self.remote_root_input)
         layout.addLayout(form)
         return frame
 
@@ -844,10 +960,7 @@ class MainWindow(QMainWindow):
             "Windows 存储",
             "正式副本与未完成临时文件位于同一个归档盘；可用空间低于保留值时暂停下载",
         )
-        form = QFormLayout()
-        form.setHorizontalSpacing(18)
-        form.setVerticalSpacing(9)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        form = self._settings_form()
         self.local_root_input = QLineEdit()
         row = QWidget()
         row_layout = QHBoxLayout(row)
@@ -863,17 +976,14 @@ class MainWindow(QMainWindow):
         self.reserve_input.setRange(1, 1024)
         self.reserve_input.setSuffix(" GiB")
         self.reserve_input.setFixedWidth(126)
-        form.addRow("本地归档目录", row)
-        form.addRow("磁盘保留空间", self.reserve_input)
+        self._form_row(form, "本地归档目录", row)
+        self._form_row(form, "磁盘保留空间", self.reserve_input)
         layout.addLayout(form)
         return frame
 
     def _transfer_section(self) -> QWidget:
         frame, layout = self._section("同步限制", "带宽为整个客户端的总上限")
-        form = QFormLayout()
-        form.setHorizontalSpacing(18)
-        form.setVerticalSpacing(9)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        form = self._settings_form()
         self.workers_input = QSpinBox()
         self.workers_input.setRange(1, 4)
         self.workers_input.setFixedWidth(126)
@@ -881,8 +991,8 @@ class MainWindow(QMainWindow):
         self.bandwidth_input.setFixedWidth(160)
         for label, value in (("不限速", 0), ("5 MiB/s", 5), ("10 MiB/s", 10), ("20 MiB/s", 20), ("50 MiB/s", 50)):
             self.bandwidth_input.addItem(label, value)
-        form.addRow("并发任务", self.workers_input)
-        form.addRow("总带宽", self.bandwidth_input)
+        self._form_row(form, "并发任务", self.workers_input)
+        self._form_row(form, "总带宽", self.bandwidth_input)
         layout.addLayout(form)
         return frame
 
@@ -890,11 +1000,7 @@ class MainWindow(QMainWindow):
         frame, layout = self._section(
             "告警通知", "窗口最小化时，失败与停更通过 Telegram 主动通知"
         )
-        form = QFormLayout()
-        form.setHorizontalSpacing(18)
-        form.setVerticalSpacing(9)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form = self._settings_form()
         self.alert_enabled_input = QComboBox()
         self.alert_enabled_input.setFixedWidth(160)
         self.alert_enabled_input.addItem("关闭", False)
@@ -923,13 +1029,13 @@ class MainWindow(QMainWindow):
         test_layout.setContentsMargins(0, 0, 0, 0)
         test_layout.addWidget(self.alert_test_button)
         test_layout.addStretch(1)
-        form.addRow("告警通知", self.alert_enabled_input)
-        form.addRow("机器人令牌", self.alert_token_input)
-        form.addRow("会话 ID", self.alert_chat_input)
-        form.addRow("推送级别", self.alert_level_input)
-        form.addRow("扫描中断", self.alert_stale_input)
-        form.addRow("数据源停更", self.alert_lag_input)
-        form.addRow("", test_row)
+        self._form_row(form, "告警通知", self.alert_enabled_input)
+        self._form_row(form, "机器人令牌", self.alert_token_input)
+        self._form_row(form, "会话 ID", self.alert_chat_input)
+        self._form_row(form, "推送级别", self.alert_level_input)
+        self._form_row(form, "扫描中断", self.alert_stale_input)
+        self._form_row(form, "数据源停更", self.alert_lag_input)
+        self._form_row(form, "", test_row)
         layout.addLayout(form)
         self.alert_health_label = QLabel()
         self.alert_health_label.setObjectName("sectionDescription")
@@ -1456,7 +1562,17 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(500, lambda: self.start_scan(
                 automatic=self.config.auto_sync_enabled
             ))
-        self.statusBar().showMessage(self.task_title.text(), 5000)
+        QTimer.singleShot(3000, self._clear_finished_progress)
+
+    def _clear_finished_progress(self) -> None:
+        """A finished bar is worth a moment, not the rest of the day.
+
+        Left at 100% it kept reading as a task about to finish, hours after the
+        last one had.  Only the idle case clears, so the rescan that follows a
+        sync is never zeroed out from under itself.
+        """
+        if self.busy_operation not in RUNNING_OPERATIONS:
+            self.task_progress.setValue(0)
 
     def _on_operation_error(self, operation: str, message: str) -> None:
         self.busy_operation = ""
@@ -1464,8 +1580,10 @@ class MainWindow(QMainWindow):
         cancelled = "取消" in message
         self.task_title.setText("已取消" if cancelled else "操作失败")
         self.task_detail.setText(message)
+        # A failure is not progress: the second of these two lines used to be a
+        # repeat of the first, which left the bar wherever the task stopped.
         self.task_progress.setRange(0, 1000)
-        self.task_progress.setRange(0, 1000)
+        self.task_progress.setValue(0)
         self.state_store.event("warning" if cancelled else "error", self.task_title.text(), message)
         automatic = operation in {"auto_scan", "auto_sync"}
         if not cancelled and not automatic:
@@ -1474,7 +1592,6 @@ class MainWindow(QMainWindow):
             self.tray_icon.showMessage(
                 "自动同步失败", message, QSystemTrayIcon.MessageIcon.Warning, 6000
             )
-        self.statusBar().showMessage(self.task_title.text(), 8000)
         self.floating_window.set_status(
             "已取消" if cancelled else "异常",
             message, 0,
@@ -1491,7 +1608,9 @@ class MainWindow(QMainWindow):
         self.verify_button.setEnabled(not busy)
         self.save_button.setEnabled(not busy)
         self.test_button.setEnabled(not busy)
-        self.cancel_button.setEnabled(self.busy_operation in {"scan", "auto_scan", "sync", "auto_sync", "verify"})
+        self.cancel_button.setEnabled(
+            self.busy_operation in RUNNING_OPERATIONS - {"test"}
+        )
         self._update_tray_state()
 
     def _update_action_state(self) -> None:
@@ -1706,13 +1825,20 @@ class MainWindow(QMainWindow):
         continuity, gaps = archive_continuity(self.catalog.days)
         self.continuity_label.setText(f"{continuity} 天")
         self.gap_label.setText(str(gaps))
-        scanned = timestamp_text(self.catalog.scanned_at)
-        self.last_scan_label.setText(scanned)
+        self._refresh_scan_age()
         self._render_disk_metric()
         if not self.busy_operation:
             self.task_title.setText("空闲")
             self.task_progress.setRange(0, 1000)
             self.task_progress.setValue(0)
+
+    def _refresh_scan_age(self) -> None:
+        scanned = self.catalog.scanned_at
+        self.last_scan_label.setText(age_text(scanned))
+        self.last_scan_label.setToolTip(
+            f"上次成功扫描 Ubuntu 的时间：{timestamp_text(scanned)}"
+            if scanned else "还没有成功扫描过 Ubuntu"
+        )
 
     def _render_disk_metric(self) -> None:
         """Free space belongs on the default page, not buried in settings.
