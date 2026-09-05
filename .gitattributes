@@ -1,0 +1,3 @@
+# The working tree is LF today and the launcher runs fine that way; pin it so a
+# checkout on a machine with core.autocrlf=true does not rewrite every file.
+* text=auto eol=lf
