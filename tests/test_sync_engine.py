@@ -140,6 +140,54 @@ def test_sync_downloads_verifies_and_publishes_atomically(tmp_path, monkeypatch)
     assert "传输校验" in rescanned_day.local_detail
 
 
+def test_a_day_that_cannot_fit_is_refused_before_the_first_byte(
+    tmp_path, monkeypatch
+) -> None:
+    """Running out of room mid-transfer is the worst moment to find out.
+
+    A volume that fills up halfway through fails inside one object out of
+    hundreds, leaving the user to work out which.  So the room a day needs is
+    checked first, and the refusal names the client's own leftovers - the space
+    the user can reclaim without touching the archive itself.
+    """
+    day, _remote = _build_fixture(tmp_path)
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def download(self, *_args, **_kwargs):
+            raise AssertionError("a refused day must not download anything")
+
+    monkeypatch.setattr("smsi_archive_sync.sync_engine.RemoteArchiveClient", FakeClient)
+    monkeypatch.setattr(
+        "smsi_archive_sync.sync_engine.free_bytes", lambda _path: 4 * 1024**3
+    )
+    config = AppConfig(
+        local_root=str(tmp_path / "archive"), bandwidth_mib=0, minimum_free_gib=10
+    )
+    leftovers = (
+        config.local_path / "collector=tencent-paper" / ".quarantine" / "old"
+    )
+    leftovers.mkdir(parents=True)
+    (leftovers / "leftover.bin").write_bytes(b"z" * 4096)
+
+    with pytest.raises(RuntimeError) as failure:
+        SyncEngine(config).sync_day(day)
+
+    assert "空间不足" in str(failure.value)
+    assert "隔离目录" in str(failure.value)
+    collector = config.local_path / "collector=tencent-paper"
+    assert not (collector / "date=2026-08-09").exists()
+    assert not (collector / ".partial" / "date=2026-08-09" / "control").exists()
+
+
 def _publish_local_copy(tmp_path: Path) -> tuple[ArchiveDay, AppConfig, Path]:
     """Lay down a verified local copy the way a finished sync leaves it."""
     day, remote = _build_fixture(tmp_path)

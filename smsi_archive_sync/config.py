@@ -64,6 +64,7 @@ class AppConfig:
     host_fingerprint: str = ""
     remote_root: str = REMOTE_ROOT
     local_root: str = ""
+    minimum_free_gib: int = 10
     download_workers: int = 2
     bandwidth_mib: int = 20
     auto_sync_enabled: bool = False
@@ -136,6 +137,8 @@ class AppConfig:
             errors.append("远端根目录必须是 /data/smsi-archive")
         if not self.local_root.strip():
             errors.append("请选择 Windows 本地归档目录")
+        if not 1 <= int(self.minimum_free_gib) <= 1024:
+            errors.append("磁盘保留空间必须为 1 至 1024 GiB")
         if not 1 <= int(self.download_workers) <= 4:
             errors.append("同步并发必须为 1 至 4")
         if int(self.bandwidth_mib) not in {0, 5, 10, 20, 50}:
@@ -158,6 +161,7 @@ class AppConfig:
             host_fingerprint=str(value.get("host_fingerprint") or "").strip(),
             remote_root=REMOTE_ROOT,
             local_root=str(value.get("local_root") or default_local_root()),
+            minimum_free_gib=int(value.get("minimum_free_gib") or 10),
             download_workers=int(value.get("download_workers") or 2),
             bandwidth_mib=bandwidth,
             auto_sync_enabled=bool(value.get("auto_sync_enabled", False)),

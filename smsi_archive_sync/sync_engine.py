@@ -24,6 +24,7 @@ from .remote import (
     RemoteArchiveClient,
     safe_remote_path,
 )
+from .storage import bytes_text, directory_bytes, free_bytes, reserve_bytes
 from .verifier import (
     build_transport_verification_report,
     local_object_path,
@@ -308,6 +309,53 @@ class SyncEngine:
         )
         return verification
 
+    def _pending_bytes(self, day: ArchiveDay, stage: Path) -> int:
+        """Bytes this run still has to write, ignoring what is already staged.
+
+        Size alone decides here, exactly as the download fast path does: a
+        staged file of the right length costs nothing more to keep, and if its
+        digest turns out wrong the reserve absorbs the re-download.
+        """
+        pending = 0
+        for obj in day.objects:
+            destination = local_object_path(stage, obj.relative_key, day.archive_date)
+            try:
+                if destination.stat().st_size == obj.size_bytes:
+                    continue
+            except OSError:
+                pass
+            pending += obj.size_bytes
+        return pending
+
+    def _require_room(self, day: ArchiveDay, stage: Path, quarantine: Path) -> None:
+        """Refuse a day that cannot fit before writing its first byte.
+
+        Filling the volume mid-transfer fails inside one object and leaves the
+        user to work out which of a hundred files ran out of room.  Publishing
+        is a rename on the same volume and quarantining moves nothing off it, so
+        the space a run needs is simply what it still has to download, plus the
+        margin the volume must keep.
+        """
+        pending = self._pending_bytes(day, stage)
+        reserve = reserve_bytes(self.config.minimum_free_gib)
+        try:
+            free = free_bytes(stage)
+        except OSError as exc:
+            raise RuntimeError(f"无法读取本地归档盘可用空间：{exc}") from exc
+        if free >= pending + reserve:
+            return
+        held = directory_bytes(quarantine)
+        hint = (
+            f"；客户端隔离目录仍占用 {bytes_text(held)}，确认无用后可手动删除 {quarantine}"
+            if held > 0
+            else ""
+        )
+        raise RuntimeError(
+            f"本地归档盘空间不足，{day.key} 未开始下载："
+            f"仍需下载 {bytes_text(pending)}，另需保留 {bytes_text(reserve)}，"
+            f"当前可用 {bytes_text(free)}{hint}"
+        )
+
     def sync_day(self, day: ArchiveDay) -> dict[str, Any]:
         if not day.eligible:
             raise RuntimeError(f"{day.key} 当前不可同步")
@@ -317,6 +365,7 @@ class SyncEngine:
             return migrated
         final, _stage_path, quarantine = self._roots(day)
         stage = self._prepare_stage(day, snapshot)
+        self._require_room(day, stage, quarantine)
         object_progress = {obj.relative_key: 0 for obj in day.objects}
         object_sizes = {obj.relative_key: obj.size_bytes for obj in day.objects}
         object_done: set[str] = set()

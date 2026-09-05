@@ -2,13 +2,15 @@
 
 This client holds the last copy in the chain and is also the copy nobody
 watches: the window normally sits minimised in the tray, so a failure drawn on
-screen is a failure nobody sees.  Three triggers are covered here:
+screen is a failure nobody sees.  Four triggers are covered here:
 
 * recorded events at or above a configured level, forwarded once each;
 * *no successful scan* while automatic sync is on - a client whose loop has
   stalled records no events at all, which event-driven alerting cannot catch;
 * *upstream silence* - the Ubuntu verified copy has stopped publishing new
-  archive days, which is a fault further up the chain rather than here.
+  archive days, which is a fault further up the chain rather than here;
+* *the archive volume* running out of room or going missing, which has to be
+  reported while there is still space to act rather than after a sync fails.
 
 Automatic sync retries on a timer, so the same fault is recorded again every
 few minutes.  A repeat of a fault already reported is counted rather than sent
@@ -34,6 +36,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from .config import AppConfig, ConfigStore
 from .state import StateStore
+from .storage import bytes_text, disk_status
 
 
 LOGGER = logging.getLogger(__name__)
@@ -158,7 +161,8 @@ def archive_watch_record(scanned_at: str, archive_dates: Sequence[str]) -> dict[
     return {"scanned_at": str(scanned_at or ""), "newest_archive_date": newest}
 
 class AlertNotifier:
-    """Forwards recorded events, a stalled scan loop and upstream silence.
+    """Forwards recorded events, a stalled scan loop, upstream silence and a
+    failing archive volume.
 
     State lives in the local database so that a restart neither replays old
     alerts nor forgets an alarm that is still active.  ``sender`` and ``now``
@@ -211,6 +215,7 @@ class AlertNotifier:
             "last_error_at": str(state.get("last_error_at") or ""),
             "scan_alerted": bool(state.get("scan_alerted")),
             "upstream_alerted": bool(state.get("upstream_alerted")),
+            "disk_alerted": bool(state.get("disk_alerted")),
             "pending_events": bool(state.get("pending_events")),
         }
 
@@ -336,6 +341,42 @@ class AlertNotifier:
             return [f"· 数据源已恢复，最新归档日 {newest}"], False
         return [], None
 
+    def _disk_lines(
+        self, config: AppConfig, state: Mapping[str, Any]
+    ) -> tuple[list[str], bool | None]:
+        """Report the archive volume running out of room, or going missing.
+
+        This alarm has to arrive early: once the volume is full the client can
+        only refuse to sync, and the copy it is protecting is the last one in the
+        chain.  The reading is local and live, so unlike the upstream alarm it
+        needs no freshness condition.
+        """
+        status = disk_status(config.local_root, config.minimum_free_gib)
+        alerted = bool(state.get("disk_alerted"))
+        if not status["ok"]:
+            if alerted:
+                return [], None
+            return [
+                "! 本地归档目录无法访问，同步与校验都会失败",
+                f"    归档目录 {config.local_root}",
+                f"    {status['error']}",
+                "    这台机器保存归档链条的最后一份副本，请确认归档盘是否掉线",
+            ], True
+        if status["low"]:
+            if alerted:
+                return [], None
+            return [
+                f"! 本地归档盘可用空间不足，仅剩 {bytes_text(status['free_bytes'])}",
+                f"    保留下限 {bytes_text(status['reserve_bytes'])}，"
+                "低于该值时同步会提前停下，不会写坏已有副本",
+                f"    归档目录 {config.local_root}",
+            ], True
+        if alerted:
+            return [
+                f"· 本地归档盘已恢复，可用 {bytes_text(status['free_bytes'])}"
+            ], False
+        return [], None
+
     def poll(self) -> dict[str, Any]:
         """One alerting pass.  Never raises: alerting must not break the app."""
         try:
@@ -388,9 +429,10 @@ class AlertNotifier:
         )
         forwarded, faults = self._partition_events(events, state)
         watch = self._watch()
+        disk_lines, disk_flag = self._disk_lines(config, state)
         scan_lines, scan_flag = self._scan_silence_lines(config, watch, state)
         upstream_lines, upstream_flag = self._upstream_lines(config, watch, state)
-        lines = scan_lines + upstream_lines + self._event_lines(forwarded)
+        lines = disk_lines + scan_lines + upstream_lines + self._event_lines(forwarded)
         if not lines:
             if events:
                 # Every fetched event was a repeat of something already
@@ -433,6 +475,8 @@ class AlertNotifier:
             parts.append("扫描中断" if scan_flag else "扫描已恢复")
         if upstream_lines:
             parts.append("数据源停更" if upstream_flag else "数据源已恢复")
+        if disk_lines:
+            parts.append("归档盘异常" if disk_flag else "归档盘已恢复")
         headline = "、".join(parts) or "状态更新"
 
         try:
@@ -447,6 +491,8 @@ class AlertNotifier:
             state["scan_alerted"] = scan_flag
         if upstream_flag is not None:
             state["upstream_alerted"] = upstream_flag
+        if disk_flag is not None:
+            state["disk_alerted"] = disk_flag
         state["pending_events"] = bool(
             self.state_store.events_since(
                 int(state.get("last_event_id") or 0), levels, limit=1

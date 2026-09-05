@@ -43,23 +43,14 @@ from .models import ArchiveCatalog, ArchiveDay, RemoteObject, STATUS_LABELS
 from .remote import HostKeyRequired, RemoteArchiveClient
 from .scanner import scan_catalog
 from .state import StateStore
+from .storage import bytes_text, disk_status
 from .sync_engine import SyncEngine
 
 
 LOGGER = logging.getLogger(__name__)
 NODE_ROLE = Qt.ItemDataRole.UserRole
 AUTO_SYNC_LOOKBACK_DAYS = 7
-
-
-def bytes_text(value: Any) -> str:
-    number = float(value or 0)
-    units = ("B", "KiB", "MiB", "GiB", "TiB")
-    index = 0
-    while number >= 1024 and index < len(units) - 1:
-        number /= 1024
-        index += 1
-    precision = 0 if number >= 10 or index == 0 else 1
-    return f"{number:.{precision}f} {units[index]}"
+DANGER_COLOR = "#b42318"
 
 
 def duration_text(value: Any) -> str:
@@ -415,7 +406,7 @@ class MainWindow(QMainWindow):
         menu.addAction(self.auto_sync_action)
 
         self.stop_sync_action = QAction(
-            lucide_icon("square", "#b42318"), "停止同步", self
+            lucide_icon("square", DANGER_COLOR), "停止同步", self
         )
         self.stop_sync_action.triggered.connect(self.stop_all_sync)
         menu.addAction(self.stop_sync_action)
@@ -430,7 +421,7 @@ class MainWindow(QMainWindow):
         menu.addAction(self.floating_window_action)
         menu.addSeparator()
 
-        exit_action = QAction(lucide_icon("power", "#b42318"), "退出客户端", self)
+        exit_action = QAction(lucide_icon("power", DANGER_COLOR), "退出客户端", self)
         exit_action.triggered.connect(self._exit_from_tray)
         menu.addAction(exit_action)
 
@@ -702,6 +693,8 @@ class MainWindow(QMainWindow):
         self._metric_divider(layout)
         self.pending_label = self._metric(layout, "待同步数据", "0 B", 100)
         self._metric_divider(layout)
+        self.disk_label = self._metric(layout, "归档盘可用", "--", 100)
+        self._metric_divider(layout)
         self.verified_label = self._metric(layout, "本地已验证", "0", 88)
         self._metric_divider(layout)
         self.continuity_label = self._metric(layout, "连续完整", "0 天", 82)
@@ -749,7 +742,7 @@ class MainWindow(QMainWindow):
         self.task_detail.setMinimumWidth(0)
         self.cancel_button = QPushButton("取消")
         self.cancel_button.setObjectName("dangerButton")
-        self.cancel_button.setIcon(lucide_icon("x", "#b42318"))
+        self.cancel_button.setIcon(lucide_icon("x", DANGER_COLOR))
         self.cancel_button.setEnabled(False)
         self.cancel_button.setFixedWidth(82)
         top.addWidget(self.task_title)
@@ -847,7 +840,10 @@ class MainWindow(QMainWindow):
         return frame
 
     def _storage_section(self) -> QWidget:
-        frame, layout = self._section("Windows 存储", "正式副本与未完成临时文件位于同一个归档盘")
+        frame, layout = self._section(
+            "Windows 存储",
+            "正式副本与未完成临时文件位于同一个归档盘；可用空间低于保留值时暂停下载",
+        )
         form = QFormLayout()
         form.setHorizontalSpacing(18)
         form.setVerticalSpacing(9)
@@ -863,7 +859,12 @@ class MainWindow(QMainWindow):
         button.clicked.connect(self._choose_local_root)
         row_layout.addWidget(self.local_root_input, 1)
         row_layout.addWidget(button)
+        self.reserve_input = QSpinBox()
+        self.reserve_input.setRange(1, 1024)
+        self.reserve_input.setSuffix(" GiB")
+        self.reserve_input.setFixedWidth(126)
         form.addRow("本地归档目录", row)
+        form.addRow("磁盘保留空间", self.reserve_input)
         layout.addLayout(form)
         return frame
 
@@ -965,6 +966,7 @@ class MainWindow(QMainWindow):
             self.password_input.clear()
         self.fingerprint_input.setText(config.host_fingerprint)
         self.local_root_input.setText(config.local_root)
+        self.reserve_input.setValue(int(config.minimum_free_gib))
         self.workers_input.setValue(config.download_workers)
         index = self.bandwidth_input.findData(config.bandwidth_mib)
         self.bandwidth_input.setCurrentIndex(max(0, index))
@@ -997,6 +999,8 @@ class MainWindow(QMainWindow):
             parts.append("当前处于「扫描中断」告警状态")
         if health["upstream_alerted"]:
             parts.append("当前处于「数据源停更」告警状态")
+        if health["disk_alerted"]:
+            parts.append("当前处于「归档盘异常」告警状态")
         if health["pending_events"]:
             parts.append("仍有待推送内容")
         self.alert_health_label.setText("；".join(parts) + "。")
@@ -1010,6 +1014,7 @@ class MainWindow(QMainWindow):
             host_fingerprint=self.fingerprint_input.text().strip(),
             remote_root=REMOTE_ROOT,
             local_root=self.local_root_input.text().strip(),
+            minimum_free_gib=self.reserve_input.value(),
             download_workers=self.workers_input.value(),
             bandwidth_mib=int(self.bandwidth_input.currentData()),
             auto_sync_enabled=self.config.auto_sync_enabled,
@@ -1042,6 +1047,9 @@ class MainWindow(QMainWindow):
         self.config = config
         self.alert_token_input.clear()
         self._render_alert_health(config)
+        # A changed reserve or archive directory must show up now, not at the
+        # next scan: this is the number the user came here to check.
+        self._render_disk_metric()
         # An alert setting is useless if it waits for the next poll interval.
         self.alert_worker.wake()
         self.statusBar().showMessage("设置已保存", 5000)
@@ -1509,7 +1517,7 @@ class MainWindow(QMainWindow):
             "manifest_changed",
             "error",
         }:
-            return QColor("#b42318")
+            return QColor(DANGER_COLOR)
         return QColor("#6b6b72")
 
     def _day_display_status(self, day: ArchiveDay) -> tuple[str, str]:
@@ -1700,10 +1708,35 @@ class MainWindow(QMainWindow):
         self.gap_label.setText(str(gaps))
         scanned = timestamp_text(self.catalog.scanned_at)
         self.last_scan_label.setText(scanned)
+        self._render_disk_metric()
         if not self.busy_operation:
             self.task_title.setText("空闲")
             self.task_progress.setRange(0, 1000)
             self.task_progress.setValue(0)
+
+    def _render_disk_metric(self) -> None:
+        """Free space belongs on the default page, not buried in settings.
+
+        A volume filling up is the one fault that gives warning before it stops
+        the archive, so the warning has to be somewhere the user already looks.
+        One reading per catalogue render is enough: the number only moves when
+        something was downloaded.
+        """
+        status = disk_status(self.config.local_root, self.config.minimum_free_gib)
+        if not status["ok"]:
+            self.disk_label.setText("无法读取")
+            self.disk_label.setStyleSheet(f"color: {DANGER_COLOR}")
+            self.disk_label.setToolTip(f"无法读取归档盘：{status['error']}")
+            return
+        self.disk_label.setText(bytes_text(status["free_bytes"]))
+        self.disk_label.setStyleSheet(
+            f"color: {DANGER_COLOR}" if status["low"] else ""
+        )
+        self.disk_label.setToolTip(
+            f"归档盘共 {bytes_text(status['total_bytes'])}，"
+            f"保留下限 {bytes_text(status['reserve_bytes'])}；"
+            "可用空间低于保留下限时同步会提前停下"
+        )
 
     def _archive_summary_detail(self, day: ArchiveDay) -> str:
         summary = day.summary

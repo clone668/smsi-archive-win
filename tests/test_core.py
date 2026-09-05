@@ -19,6 +19,7 @@ from smsi_archive_sync.remote import safe_remote_path
 from smsi_archive_sync.scanner import _archive_summary
 from smsi_archive_sync.state import StateStore
 from smsi_archive_sync.secrets import protect_password, unprotect_password
+from smsi_archive_sync.storage import GIB, directory_bytes, disk_status, usable_root
 
 
 def manifest_payload(archive_date: str = "2026-08-09") -> dict:
@@ -183,3 +184,58 @@ def test_password_is_dpapi_protected() -> None:
     assert encrypted.startswith("dpapi:v1:")
     assert "test-password" not in encrypted
     assert unprotect_password(encrypted) == "test-password"
+
+
+def test_free_space_is_read_before_the_archive_directory_exists(tmp_path: Path) -> None:
+    """A first run has no archive directory yet, but its volume has the space."""
+    missing = tmp_path / "archive" / "collector=tencent-paper" / ".partial"
+
+    assert usable_root(missing) == tmp_path
+    status = disk_status(missing, 1)
+    assert status["ok"] is True
+    assert status["free_bytes"] > 0
+    assert status["reserve_bytes"] == GIB
+    assert status["low"] is False
+
+
+def test_an_unreadable_volume_is_reported_instead_of_assumed_empty(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """"No reading" must never be allowed to look like "there is room"."""
+
+    def refuse(_path):
+        raise OSError(21, "设备未就绪")
+
+    monkeypatch.setattr("smsi_archive_sync.storage.shutil.disk_usage", refuse)
+
+    status = disk_status(tmp_path, 10)
+    assert status["ok"] is False
+    assert status["low"] is False
+    assert status["free_bytes"] == 0
+    assert "设备未就绪" in status["error"]
+
+
+def test_held_bytes_are_counted_so_a_shortage_can_be_acted_on(tmp_path: Path) -> None:
+    """The shortage message names the client's own leftovers to reclaim first."""
+    quarantine = tmp_path / ".quarantine" / "date=2026-08-09.replaced"
+    (quarantine / "control").mkdir(parents=True)
+    (quarantine / "control" / "a.parquet").write_bytes(b"x" * 1500)
+    (quarantine / "manifest.json").write_bytes(b"y" * 500)
+
+    assert directory_bytes(quarantine) == 2000
+    assert directory_bytes(tmp_path / "never-created") == 0
+
+
+def test_the_disk_reserve_is_validated_and_survives_a_reload(tmp_path: Path) -> None:
+    store = ConfigStore(tmp_path / "config")
+    config = store.load()
+    assert config.minimum_free_gib == 10
+
+    config.local_root = str(tmp_path / "archive")
+    config.minimum_free_gib = 25
+    store.save(config)
+    assert ConfigStore(tmp_path / "config").load().minimum_free_gib == 25
+
+    config.minimum_free_gib = 0
+    with pytest.raises(ValueError, match="磁盘保留空间"):
+        store.save(config)

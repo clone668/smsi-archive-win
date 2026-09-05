@@ -13,6 +13,7 @@ from smsi_archive_sync.alerts import (
 )
 from smsi_archive_sync.config import ConfigStore, validate_alert_token
 from smsi_archive_sync.state import StateStore
+from smsi_archive_sync.storage import GIB
 
 
 TOKEN = "123456789:AAEabcdefghijklmnopqrstuvwxyz0123456"
@@ -363,6 +364,73 @@ def test_a_damaged_token_is_reported_instead_of_crashing_the_thread(
     assert result["ok"] is False
     assert notifier.state()["last_error"]
     assert sender.messages == []
+
+
+def _fake_disk(monkeypatch) -> dict:
+    """A volume reading the test controls, not the one the tests run on.
+
+    Whether alerting fires must not depend on how full the developer's disk
+    happens to be, so the reading is substituted and mutated in place.
+    """
+    reading = {
+        "ok": True,
+        "error": "",
+        "free_bytes": 400 * GIB,
+        "total_bytes": 900 * GIB,
+        "reserve_bytes": 10 * GIB,
+        "low": False,
+    }
+    monkeypatch.setattr(
+        "smsi_archive_sync.alerts.disk_status", lambda *_args, **_kwargs: reading
+    )
+    return reading
+
+
+def test_a_filling_archive_disk_is_alerted_before_it_stops_the_sync(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The one fault that gives warning before it stops the archive.
+
+    Below the reserve the client refuses to sync while the volume still has
+    room, so the alarm has to arrive at that point - not after a day fails.
+    """
+    reading = _fake_disk(monkeypatch)
+    _store, _state, notifier, sender, _clock = _build(tmp_path)
+    notifier.poll()
+    assert notifier.poll()["skipped"] == "nothing_to_report"
+
+    reading.update({"free_bytes": 3 * GIB, "low": True})
+    assert notifier.poll()["sent"]
+    assert "可用空间不足" in sender.messages[0]
+    assert "3.0 GiB" in sender.messages[0]
+    assert notifier.state()["disk_alerted"] is True
+
+    assert notifier.poll()["skipped"] == "nothing_to_report"
+    assert len(sender.messages) == 1
+
+    reading.update({"free_bytes": 120 * GIB, "low": False})
+    assert notifier.poll()["sent"]
+    assert "已恢复" in sender.messages[1]
+    assert notifier.state()["disk_alerted"] is False
+    assert notifier.poll()["skipped"] == "nothing_to_report"
+
+
+def test_an_unreadable_archive_directory_is_not_reported_as_plenty_of_space(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A disconnected archive disk is worse than a full one, and says so."""
+    reading = _fake_disk(monkeypatch)
+    _store, _state, notifier, sender, _clock = _build(tmp_path)
+    notifier.poll()
+
+    reading.update({"ok": False, "error": "[WinError 21] 设备未就绪", "free_bytes": 0})
+    assert notifier.poll()["sent"]
+    assert "无法访问" in sender.messages[0]
+    assert "设备未就绪" in sender.messages[0]
+    assert notifier.state()["disk_alerted"] is True
+
+    assert notifier.poll()["skipped"] == "nothing_to_report"
+    assert len(sender.messages) == 1
 
 
 
