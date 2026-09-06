@@ -178,6 +178,21 @@ def test_config_and_state_round_trip(tmp_path: Path) -> None:
     assert loaded.days[0].summary.business_table_count == 3
 
 
+def test_a_damaged_config_file_is_reported_as_such(tmp_path: Path) -> None:
+    """The launcher catches RuntimeError to report this, so it has to be one.
+
+    A windowed process cannot print a traceback, so a config file that will not
+    parse has to arrive as a message the entry point can put in a dialog rather
+    than as whatever the JSON reader happened to raise.
+    """
+    store = ConfigStore(tmp_path / "config")
+    store.load()
+    store.path.write_text("{ not json", encoding="utf-8")
+    with pytest.raises(RuntimeError) as failure:
+        store.load()
+    assert "损坏" in str(failure.value)
+
+
 @pytest.mark.skipif(__import__("os").name != "nt", reason="Windows DPAPI only")
 def test_password_is_dpapi_protected() -> None:
     encrypted = protect_password("test-password")

@@ -11,7 +11,8 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from smsi_archive_sync.config import ConfigStore
 from smsi_archive_sync.icons import application_icon
 from smsi_archive_sync.state import StateStore
-from smsi_archive_sync.style import APP_STYLE
+from smsi_archive_sync.style import apply_theme
+from smsi_archive_sync.themes import STANDARD_THEME, resolve_theme
 from smsi_archive_sync.ui import MainWindow
 
 
@@ -39,7 +40,25 @@ def main() -> int:
     app.setApplicationDisplayName("SMSI 归档同步")
     app.setOrganizationName("SMSI")
     app.setStyle("Fusion")
-    app.setStyleSheet(APP_STYLE)
+    try:
+        config = config_store.load()
+    except RuntimeError as error:
+        # A windowed process has nowhere to print a traceback, so a configuration
+        # file it cannot read has to be reported rather than end the launch in
+        # silence.  The path is included because the repair happens in a text
+        # editor - the window that would otherwise fix it is what failed to open.
+        apply_theme(app, STANDARD_THEME)
+        logger.error("client configuration unreadable: %s", error)
+        QMessageBox.critical(
+            None,
+            "SMSI 归档同步",
+            f"{error}\n\n请修复或删除配置文件后重新启动：\n{config_store.path}",
+        )
+        return 3
+    # Applied before the single-instance check, because the warning that check
+    # shows is a Qt dialog painted from the palette, and a dark theme that only
+    # arrives with the main window would leave that one dialog white.
+    apply_theme(app, resolve_theme(config.theme))
     lock = QLockFile(str(config_store.root / "client.lock"))
     lock.setStaleLockTime(0)
     if not lock.tryLock(100):

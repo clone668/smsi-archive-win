@@ -1,25 +1,35 @@
 from __future__ import annotations
 
+import json
 import os
 from datetime import date, datetime, timedelta, timezone
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import pytest
 from PySide6.QtCore import QPoint, Qt
-from PySide6.QtGui import QAction, QFontMetrics, QIcon
+from PySide6.QtGui import QAction, QColor, QFontMetrics, QIcon, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QFormLayout,
     QFrame,
     QLabel,
+    QMenu,
     QStyle,
     QStyleOptionFrame,
 )
 
-from smsi_archive_sync.config import ConfigStore
+from smsi_archive_sync.config import AppConfig, ConfigStore
 from smsi_archive_sync.models import ArchiveCatalog, ArchiveDay, ArchiveSummary, RemoteObject
 from smsi_archive_sync.state import StateStore
-from smsi_archive_sync.style import APP_STYLE
+from smsi_archive_sync.style import apply_theme
+from smsi_archive_sync.themes import (
+    DEFAULT_THEME_NAME,
+    STANDARD_THEME,
+    THEMES,
+    build_qss,
+    normalize_theme_name,
+)
 from smsi_archive_sync.ui import (
     MainWindow,
     TreeProgressWidget,
@@ -34,7 +44,7 @@ from smsi_archive_sync.ui import (
 def test_main_window_renders(tmp_path) -> None:
     app = QApplication.instance() or QApplication([])
     app.setStyle("Fusion")
-    app.setStyleSheet(APP_STYLE)
+    apply_theme(app, STANDARD_THEME)
     store = ConfigStore(tmp_path / "config")
     window = MainWindow(store, StateStore(tmp_path / "state"), QIcon())
     window.show()
@@ -372,30 +382,48 @@ def test_tray_actions_follow_window_and_sync_state(tmp_path, monkeypatch) -> Non
     window.close()
 
 
-def _shown_window(tmp_path, page: int = 0):
-    """A styled, shown window: every layout invariant below depends on the QSS."""
+def _shown_window(tmp_path, page: int = 0, theme: str = DEFAULT_THEME_NAME):
+    """A styled, shown window: every layout invariant below depends on the QSS.
+
+    The theme is stored before the window is built, because a window measures its
+    tree header and its label column while building and would otherwise take
+    those measurements against the wrong font.
+    """
     app = QApplication.instance() or QApplication([])
     app.setStyle("Fusion")
-    app.setStyleSheet(APP_STYLE)
-    window = MainWindow(
-        ConfigStore(tmp_path / "config"),
-        StateStore(tmp_path / "state"),
-        QIcon(),
-    )
+    # Whatever the previous test left on the application, including a dark
+    # palette: these invariants must not depend on the order tests run in.
+    apply_theme(app, STANDARD_THEME)
+    store = ConfigStore(tmp_path / "config")
+    if theme != DEFAULT_THEME_NAME:
+        config = store.load()
+        config.theme = theme
+        store.save(config)
+    window = MainWindow(store, StateStore(tmp_path / "state"), QIcon())
     window.show()
     window._set_page(page)
     app.processEvents()
     return app, window
 
 
-def test_tree_header_never_clips_its_own_headings(tmp_path) -> None:
+def _release(window) -> None:
+    """Close a test window and hand the application back its light palette."""
+    window._exit_requested = True
+    window.close()
+    apply_theme(QApplication.instance(), STANDARD_THEME)
+
+
+@pytest.mark.parametrize("theme", sorted(THEMES))
+def test_tree_header_never_clips_its_own_headings(tmp_path, theme) -> None:
     """A pinned width has to be at least as wide as the word it must show.
 
     Two of the seven were not, and "Ubuntu 状态" reached the user as
     "Ubuntu 状".  The assertion is the invariant rather than the pinned numbers:
-    the heading plus the 8px of section padding on each side has to fit.
+    the heading plus the 8px of section padding on each side has to fit.  Run for
+    every theme, because a theme carries both the pinned widths and the point
+    size the headings are drawn at, and it is free to get the pair wrong.
     """
-    _app, window = _shown_window(tmp_path)
+    _app, window = _shown_window(tmp_path, theme=theme)
     header = window.tree.header()
     header.ensurePolished()
     metrics = QFontMetrics(header.font())
@@ -405,8 +433,7 @@ def test_tree_header_never_clips_its_own_headings(tmp_path) -> None:
     # The name column holds the unbounded content, so it takes the spare width.
     # Letting the last section stretch instead silently voids its pinned width.
     assert header.stretchLastSection() is False
-    window._exit_requested = True
-    window.close()
+    _release(window)
 
 
 def _first_fields(window) -> list[tuple[str, int]]:
@@ -419,47 +446,55 @@ def _first_fields(window) -> list[tuple[str, int]]:
     return rows
 
 
-def test_settings_cards_share_one_label_column(tmp_path) -> None:
+@pytest.mark.parametrize("theme", sorted(THEMES))
+def test_settings_cards_share_one_label_column(tmp_path, theme) -> None:
     """Four cards, one vertical line for the inputs to start on.
 
     A form layout measures its label column from its own longest label, so the
     card whose labels were shortest put its boxes tens of pixels left of the
-    card underneath it.
+    card underneath it.  A theme that stacks labels above their fields instead
+    satisfies this the other way: every field then starts at the same left edge
+    because none of them is indented at all.
     """
-    _app, window = _shown_window(tmp_path, page=1)
+    _app, window = _shown_window(tmp_path, page=1, theme=theme)
     rows = _first_fields(window)
     assert len(rows) >= 4
     assert len({x for _title, x in rows}) == 1, rows
-    window._exit_requested = True
-    window.close()
+    _release(window)
 
 
-def test_every_settings_field_is_the_same_height(tmp_path) -> None:
+@pytest.mark.parametrize("theme", sorted(THEMES))
+def test_every_settings_field_is_the_same_height(tmp_path, theme) -> None:
     """A spin box asks for 3px more than a line edit and has to be capped.
 
     Styling the box without capping it left 端口 and 磁盘保留空间 standing taller
-    than every other row on the page.
+    than every other row on the page.  The cap is written from the theme's own
+    control height, so every theme has to be checked, not just the shipped one.
     """
-    _app, window = _shown_window(tmp_path, page=1)
+    _app, window = _shown_window(tmp_path, page=1, theme=theme)
     heights = {
         "host": window.host_input.height(),
         "port": window.port_input.height(),
         "reserve": window.reserve_input.height(),
         "bandwidth": window.bandwidth_input.height(),
+        "theme": window.theme_input.height(),
     }
     assert len(set(heights.values())) == 1, heights
-    window._exit_requested = True
-    window.close()
+    assert heights["host"] == window.theme.metrics.control_height + 2
+    _release(window)
 
 
-def test_keyboard_focus_costs_no_geometry(tmp_path) -> None:
+@pytest.mark.parametrize("theme", sorted(THEMES))
+def test_keyboard_focus_costs_no_geometry(tmp_path, theme) -> None:
     """The accent ring is two pixels the layout must not pay for.
 
     A focus border that is not compensated in padding and min-height grows the
     widget, which pushes the form row taller and steps the text sideways - so
-    tabbing through the page makes it twitch.
+    tabbing through the page makes it twitch.  The compensation is derived from
+    the theme's control height rather than written per theme, and this is the
+    test that proves the derivation still holds after the numbers change.
     """
-    app, window = _shown_window(tmp_path, page=1)
+    app, window = _shown_window(tmp_path, page=1, theme=theme)
     for name in ("host_input", "port_input", "bandwidth_input", "save_button"):
         widget = getattr(window, name)
         before = (widget.geometry(), widget.sizeHint())
@@ -480,8 +515,7 @@ def test_keyboard_focus_costs_no_geometry(tmp_path) -> None:
     window.host_input.setFocus(Qt.FocusReason.TabFocusReason)
     app.processEvents()
     assert text_origin() == unfocused
-    window._exit_requested = True
-    window.close()
+    _release(window)
 
 
 def test_status_bar_reports_auto_sync_instead_of_the_task_band(tmp_path) -> None:
@@ -568,6 +602,218 @@ def test_scan_age_keeps_the_exact_stamp_on_the_tooltip(tmp_path) -> None:
     assert "2026-09-05 22:25:42 UTC" in window.last_scan_label.toolTip()
     window._exit_requested = True
     window.close()
+
+
+def _sources() -> tuple[str, str]:
+    """The theme table and the window, as text, for the dead-token check below."""
+    import smsi_archive_sync.themes as themes_module
+    import smsi_archive_sync.ui as ui_module
+    from pathlib import Path
+
+    return (
+        Path(themes_module.__file__).read_text(encoding="utf-8"),
+        Path(ui_module.__file__).read_text(encoding="utf-8"),
+    )
+
+
+@pytest.mark.parametrize("theme", sorted(THEMES))
+def test_every_theme_declares_a_usable_table(theme) -> None:
+    """A theme is data, and this is the check that the data is complete.
+
+    No Qt here: it runs on the numbers.  The two things that can silently go
+    wrong when a second theme is written by hand are a reading with no width
+    declared for it - which raises only when that column is reached - and a
+    colour that the theme sets but nothing paints, which leaves the light value
+    showing through the dark theme.
+    """
+    resolved = THEMES[theme]
+    assert normalize_theme_name(resolved.name) == resolved.name
+    assert resolved.label and resolved.caption
+    sheet = build_qss(resolved)
+    assert "$" not in sheet
+    metrics = resolved.metrics
+    # Eight readings on the overview strip, so eight widths and a column count
+    # that can lay them out without a hole.
+    assert len(metrics.metric_min_widths) == 8
+    assert 8 % max(1, metrics.summary_columns) == 0
+    assert {index for index, _width in metrics.tree_columns} == set(range(1, 7))
+    themes_source, ui_source = _sources()
+    for token in vars(resolved.palette):
+        used = f"${token}" in themes_source or f'"{token}"' in ui_source
+        assert used, f"{token} is set by every theme and painted by nothing"
+
+
+def _luminance(colour: str) -> float:
+    """Perceived brightness, 0 (black) to 1 (white)."""
+    value = QColor(colour)
+    return (
+        0.2126 * value.redF() + 0.7152 * value.greenF() + 0.0722 * value.blueF()
+    )
+
+
+@pytest.mark.parametrize("theme", sorted(THEMES))
+def test_dark_is_a_measurement_not_a_flag(theme) -> None:
+    """``dark=True`` decides whether Qt's own dialogs are repainted.
+
+    A theme that sets the flag without darkening its surfaces - or darkens them
+    without setting it - produces the one failure this client cannot show the
+    user its way out of: a white message box with white text in it, because a
+    message box paints from the palette and not from our stylesheet.
+    """
+    resolved = THEMES[theme]
+    surface = _luminance(resolved.palette.window)
+    text = _luminance(resolved.palette.text)
+    assert resolved.dark is (surface < text)
+    # Readable either way round: roughly the WCAG AA ratio for body text.
+    assert abs(surface - text) > 0.5
+    if resolved.dark:
+        assert surface < 0.1
+
+
+def test_switching_to_a_dark_theme_repaints_qt_dialogs_and_gives_them_back(
+    tmp_path,
+) -> None:
+    """The palette has to travel with the stylesheet, and travel back.
+
+    Restoring "our idea of light" instead of the palette the platform style
+    handed us at startup is how a client ends up with a permanently slightly
+    wrong light theme after one visit to the dark one.
+    """
+    app, window = _shown_window(tmp_path, page=1)
+    light = app.palette().color(QPalette.ColorRole.Window)
+    window.set_theme("watch")
+    app.processEvents()
+    dark = app.palette().color(QPalette.ColorRole.Window)
+    assert _luminance(dark.name()) < _luminance(light.name())
+    assert _luminance(dark.name()) < 0.1
+    window.set_theme("standard")
+    app.processEvents()
+    assert app.palette().color(QPalette.ColorRole.Window) == light
+    _release(window)
+
+
+def _strip_rows(window) -> dict[int, int]:
+    """How many readings the overview strip put on each row."""
+    grid = window._summary_grid
+    rows: dict[int, int] = {}
+    for cell in window._summary_cells:
+        index = grid.indexOf(cell)
+        assert index >= 0, "a reading was left out of the strip"
+        row = grid.getItemPosition(index)[0]
+        rows[row] = rows.get(row, 0) + 1
+    return rows
+
+
+def test_the_overview_strip_reflows_instead_of_being_rebuilt(tmp_path) -> None:
+    """Eight readings in one ruled row, or four across two rows with no rules.
+
+    Same eight widgets either way: a switch that deleted and rebuilt them would
+    also throw away whatever the strip is currently showing, and this is the
+    surface an unattended machine is left displaying.
+    """
+    app, window = _shown_window(tmp_path)
+    identity = [id(cell) for cell in window._summary_cells]
+    assert _strip_rows(window) == {0: 8}
+    assert [d.isHidden() for d in window._summary_dividers] == [False] * 7
+    assert window._summary_dividers[0].height() == window.theme.metrics.summary_divider_height
+
+    window.set_theme("watch")
+    app.processEvents()
+    assert _strip_rows(window) == {0: 4, 1: 4}
+    # A hairline separates neighbours in a row; between two rows it would be a
+    # grid nobody asked for, so the board hides them rather than dropping them.
+    assert all(divider.isHidden() for divider in window._summary_dividers)
+    assert [id(cell) for cell in window._summary_cells] == identity
+
+    window.set_theme("standard")
+    app.processEvents()
+    assert _strip_rows(window) == {0: 8}
+    assert [d.isHidden() for d in window._summary_dividers] == [False] * 7
+    assert [id(cell) for cell in window._summary_cells] == identity
+    _release(window)
+
+
+def test_switching_theme_keeps_the_work_in_progress(tmp_path) -> None:
+    """Nothing is rebuilt, so nothing on screen is lost.
+
+    The window this runs on has a day open in the tree and an edit in a settings
+    box that has not been saved.  A switch that reconstructed the pages would
+    collapse the first and discard the second.
+    """
+    app, window = _shown_window(tmp_path)
+    day = ArchiveDay(
+        collector_id="tencent-paper",
+        archive_date="2026-08-09",
+        remote_status="ready",
+        object_count=1,
+        objects=[RemoteObject(
+            relative_key="date=2026-08-09/control/example.parquet",
+            size_bytes=10,
+            sha256="0" * 64,
+        )],
+    )
+    day.set_manifest_raw(b"{}")
+    window.catalog = ArchiveCatalog(days=[day])
+    window._populate_tree(window.catalog)
+    window._tree_day_items[day.key].setExpanded(True)
+    window.host_input.setText("192.168.2.241")
+    app.processEvents()
+    before = window.tree.rowHeight(window.tree.model().index(0, 0))
+
+    window.set_theme("watch")
+    app.processEvents()
+    assert window._tree_day_items[day.key].isExpanded() is True
+    assert (day.key, day.objects[0].relative_key) in window._tree_file_items
+    assert window.host_input.text() == "192.168.2.241"
+    assert window.pages.currentIndex() == 0
+    # And the tree did get the message: taller rows are the point of the board.
+    assert window.tree.rowHeight(window.tree.model().index(0, 0)) > before
+    _release(window)
+
+
+def test_the_tray_and_the_settings_page_agree_about_the_theme(tmp_path) -> None:
+    """Two ways in, one answer, and 保存 must not undo either of them.
+
+    The window is normally hidden behind the tray icon, so the submenu is the
+    only theme control some operators ever see.  Because the choice is written
+    the moment it is made, the settings form has to carry it forward - otherwise
+    saving an unrelated setting a minute later silently reverts the theme.
+    """
+    app, window = _shown_window(tmp_path, page=1)
+    # The offscreen platform reports no system tray, so _build_tray returns
+    # before it gets this far; the submenu itself is what is under test.
+    window._build_theme_menu(QMenu(window))
+    window._theme_actions["watch"].trigger()
+    app.processEvents()
+    assert window.theme.name == "watch"
+    assert window.theme_input.currentData() == "watch"
+    assert window.theme_caption.text() == THEMES["watch"].caption
+    checked = {name for name, action in window._theme_actions.items() if action.isChecked()}
+    assert checked == {"watch"}
+    assert window.config_store.load().theme == "watch"
+
+    window.reserve_input.setValue(12)
+    window.save_settings()
+    saved = window.config_store.load()
+    assert (saved.theme, saved.minimum_free_gib) == ("watch", 12)
+    _release(window)
+
+
+def test_an_unknown_stored_theme_never_blocks_startup(tmp_path) -> None:
+    """A hand-edited or downgraded config must still open the window.
+
+    ``ConfigStore.load`` turns any validation error into a refusal to start, so
+    the theme is normalised on the way in rather than validated: the one setting
+    whose only repair surface is the window itself cannot be the setting that
+    stops the window from opening.
+    """
+    store = ConfigStore(tmp_path / "config")
+    store.path.write_text(
+        json.dumps({**store.load().to_dict(), "theme": "midnight"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    assert store.load().theme == DEFAULT_THEME_NAME
+    assert AppConfig(theme="").theme == DEFAULT_THEME_NAME
 
 
 

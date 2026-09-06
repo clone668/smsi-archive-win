@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .secrets import protect_password, unprotect_password
+from .themes import DEFAULT_THEME_NAME, normalize_theme_name
 
 
 APP_DATA_NAME = "SMSIArchiveSync"
@@ -75,11 +76,18 @@ class AppConfig:
     alert_min_level: str = "warning"
     alert_stale_hours: int = 6
     alert_upstream_lag_days: int = 3
+    theme: str = DEFAULT_THEME_NAME
 
     def __post_init__(self) -> None:
         if not self.local_root:
             self.local_root = str(default_local_root())
         self.remote_root = REMOTE_ROOT
+        # Normalised here rather than validated: an unknown theme is the one
+        # setting that must never make the file unloadable, because load() turns
+        # any validation error into a refusal to start.  A name this build does
+        # not have is a downgrade or a hand edit, not a reason to lock the user
+        # out of the window that would let them fix it.
+        self.theme = normalize_theme_name(self.theme)
 
     @property
     def local_path(self) -> Path:
@@ -172,6 +180,7 @@ class AppConfig:
             alert_min_level=str(value.get("alert_min_level") or "warning").strip(),
             alert_stale_hours=int(value.get("alert_stale_hours") or 6),
             alert_upstream_lag_days=int(value.get("alert_upstream_lag_days") or 3),
+            theme=str(value.get("theme") or DEFAULT_THEME_NAME),
         )
 
 

@@ -8,7 +8,7 @@ from pathlib import PurePosixPath
 from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QPoint, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QFontMetrics, QIcon
+from PySide6.QtGui import QAction, QActionGroup, QColor, QFontMetrics, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -38,20 +38,21 @@ from PySide6.QtWidgets import (
 from . import __version__
 from .alerts import AlertNotifier, AlertWorker
 from .config import ALERT_LEVELS, AppConfig, ConfigStore, REMOTE_ROOT, validate_alert_token
-from .icons import ACCENT_COLOR, ICON_COLOR, SUCCESS_COLOR, lucide_icon
+from .icons import lucide_icon
 from .models import ArchiveCatalog, ArchiveDay, RemoteObject, STATUS_LABELS
 from .remote import HostKeyRequired, RemoteArchiveClient
 from .scanner import scan_catalog
 from .state import StateStore
 from .storage import bytes_text, disk_status
+from .style import apply_theme
 from .sync_engine import SyncEngine
+from .themes import THEMES, Theme, resolve_theme
 
 
 LOGGER = logging.getLogger(__name__)
 NODE_ROLE = Qt.ItemDataRole.UserRole
 AUTO_SYNC_LOOKBACK_DAYS = 7
-DANGER_COLOR = "#b42318"
-# Longest label on the settings page.  All four cards measure one shared label
+# Longest label on the settings page.  Every card measures one shared label
 # column from it, so their input boxes start on the same vertical line instead
 # of each card sizing a column from its own longest label.
 FORM_LABEL_SAMPLE = "本地归档目录"
@@ -243,7 +244,7 @@ class FloatingStatusWindow(QWidget):
     open_requested = Signal()
     menu_requested = Signal(QPoint)
 
-    def __init__(self, icon: QIcon) -> None:
+    def __init__(self, icon: QIcon, theme: Theme) -> None:
         super().__init__(None)
         self.setObjectName("floatingWindow")
         self.setWindowTitle("SMSI 同步状态")
@@ -254,7 +255,7 @@ class FloatingStatusWindow(QWidget):
             | Qt.WindowType.WindowStaysOnTopHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setFixedSize(164, 72)
+        self.setFixedSize(*theme.metrics.float_size)
         self._drag_origin: QPoint | None = None
         self._position_initialized = False
 
@@ -288,6 +289,15 @@ class FloatingStatusWindow(QWidget):
         layout.addWidget(self.progress)
         outer.addWidget(self.panel)
         self.setToolTip("双击打开 SMSI 归档同步")
+
+    def set_theme(self, theme: Theme) -> None:
+        """Follow the theme's own size.
+
+        A block whose size is pinned in pixels cannot follow a theme that makes
+        its two labels a point larger: the speed reading would be the thing that
+        got clipped, and that is the number the block exists for.
+        """
+        self.setFixedSize(*theme.metrics.float_size)
 
     def show_near_work_area(self) -> None:
         if not self._position_initialized:
@@ -351,6 +361,13 @@ class MainWindow(QMainWindow):
         self.config_store = config_store
         self.state_store = state_store
         self.config = self.config_store.load()
+        # Before anything is built.  Control heights, row heights and point sizes
+        # come out of the theme, and several of them are measured at build time -
+        # the tree header fits itself to its own headings, the settings page
+        # measures one shared label column - so a theme applied afterwards would
+        # leave those measurements taken against the wrong font.
+        self.theme = resolve_theme(self.config.theme)
+        self._apply_theme_to_application()
         self.catalog = ArchiveCatalog()
         self.signals = UiSignals()
         self.busy_operation = ""
@@ -359,16 +376,30 @@ class MainWindow(QMainWindow):
         self._tree_day_items: dict[str, QTreeWidgetItem] = {}
         self._tree_file_items: dict[tuple[str, str], QTreeWidgetItem] = {}
         self._form_labels: list[QLabel] = []
+        # Everything a theme change has to reach after the window exists.  Held
+        # as references rather than looked up by object name, because a live
+        # switch must move the numbers in these exact layouts, and findChildren
+        # would also collect the ones a future page happens to name the same.
+        self._page_layouts: list[QVBoxLayout] = []
+        self._card_layouts: list[QVBoxLayout] = []
+        self._forms: list[QFormLayout] = []
+        self._summary_cells: list[QWidget] = []
+        self._summary_boxes: list[QVBoxLayout] = []
+        self._summary_dividers: list[QFrame] = []
+        self._sized_inputs: list[tuple[QWidget, str]] = []
+        self._theme_actions: dict[str, QAction] = {}
         self._exit_requested = False
         self._tray_notice_shown = False
         self.tray_icon: QSystemTrayIcon | None = None
         self.tray_menu: QMenu | None = None
+        self.theme_menu: QMenu | None = None
         self.show_window_action: QAction | None = None
         self.auto_sync_action: QAction | None = None
         self.stop_sync_action: QAction | None = None
         self.floating_window_action: QAction | None = None
+        self.exit_action: QAction | None = None
         self._startup_loading = True
-        self.floating_window = FloatingStatusWindow(icon)
+        self.floating_window = FloatingStatusWindow(icon, self.theme)
         self.floating_window.open_requested.connect(self._show_from_tray)
         self.floating_window.menu_requested.connect(self._show_tray_menu_at)
         # The floating block is an explicit, per-session view; it never appears during startup.
@@ -412,6 +443,97 @@ class MainWindow(QMainWindow):
         frame = self.frameGeometry()
         frame.moveCenter(available.center())
         self.move(frame.topLeft())
+
+    def _icon(self, name: str, token: str = "icon") -> QIcon:
+        """A themed icon.
+
+        The colour is named as a palette token instead of being written in, so
+        the same call site serves every theme.  Icons are cached per name and
+        colour, so a switch re-renders each glyph once and is then free.
+        """
+        return lucide_icon(name, getattr(self.theme.palette, token))
+
+    def _apply_theme_to_application(self) -> None:
+        application = QApplication.instance()
+        if isinstance(application, QApplication):
+            apply_theme(application, self.theme)
+
+    def set_theme(self, name: str) -> None:
+        """Switch theme on a live window.
+
+        Nothing is rebuilt.  The stylesheet carries the colours and the control
+        heights; this pushes the numbers the stylesheet cannot reach - layout
+        margins, spacings, fixed widths, how the overview strip is arranged -
+        into the layouts that were kept for exactly this, then re-measures the
+        two places that fit themselves to the font.  Rebuilding instead would
+        throw away the tree's expanded dates and the unsaved settings form.
+        """
+        theme = resolve_theme(name)
+        if theme.name == self.theme.name:
+            return
+        self.theme = theme
+        self.config.theme = theme.name
+        self._apply_theme_to_application()
+        self._apply_theme_layout()
+        self._save_runtime_preferences()
+
+    def _apply_theme_layout(self) -> None:
+        metrics = self.theme.metrics
+        self.top_bar.setFixedHeight(metrics.top_bar_height)
+        self.top_bar_layout.setContentsMargins(*metrics.top_bar_margins)
+        self.top_bar_layout.setSpacing(metrics.top_bar_spacing)
+        self.top_bar_spacer.changeSize(metrics.top_bar_gap, 0)
+        for layout in self._page_layouts:
+            layout.setContentsMargins(*metrics.page_margins)
+            layout.setSpacing(metrics.page_spacing)
+        for layout in self._card_layouts:
+            layout.setContentsMargins(*metrics.card_margins)
+            layout.setSpacing(metrics.card_spacing)
+        self.settings_content.setMaximumWidth(metrics.content_max_width)
+        self.settings_content_layout.setSpacing(metrics.page_spacing)
+        for form in self._forms:
+            self._apply_form_metrics(form)
+        for widget, kind in self._sized_inputs:
+            widget.setFixedWidth(getattr(metrics, f"{kind}_width"))
+        self.task_layout.setContentsMargins(*metrics.task_margins)
+        self.task_layout.setSpacing(metrics.task_spacing)
+        self.cancel_button.setFixedWidth(metrics.cancel_width)
+        self._arrange_summary()
+        self._apply_tree_metrics()
+        self._align_form_labels()
+        self._sync_theme_controls()
+        self._refresh_static_icons()
+        self.floating_window.set_theme(self.theme)
+        # Item colours and per-item icons are painted, not styled, so the tree is
+        # the one surface that has to be drawn again from the catalogue.
+        self._populate_tree(self.catalog)
+        self._render_disk_metric()
+        self._update_auto_sync_chip()
+
+    def _refresh_static_icons(self) -> None:
+        """Re-colour every icon the window keeps a handle on."""
+        self._set_page(self.pages.currentIndex())
+        self.refresh_button.setIcon(self._icon("refresh-cw"))
+        self.sync_button.setIcon(self._icon("download", "on_accent"))
+        self.verify_button.setIcon(self._icon("shield-check", "accent"))
+        self.cancel_button.setIcon(self._icon("x", "danger"))
+        self.test_button.setIcon(self._icon("plug-zap", "accent"))
+        self.save_button.setIcon(self._icon("save", "on_accent"))
+        self.alert_test_button.setIcon(self._icon("send", "accent"))
+        self.browse_button.setIcon(self._icon("folder-open"))
+        for action, name, token in (
+            (self.show_window_action, "panel-top-open", "accent"),
+            (self.auto_sync_action, "refresh-cw", "accent"),
+            (self.stop_sync_action, "square", "danger"),
+            (self.floating_window_action, "picture-in-picture-2", "icon"),
+            (self.exit_action, "power", "danger"),
+        ):
+            if action is not None:
+                action.setIcon(self._icon(name, token))
+        for name, action in self._theme_actions.items():
+            action.setIcon(self._icon(
+                "check" if name == self.theme.name else "circle", "accent"
+            ))
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -458,14 +580,14 @@ class MainWindow(QMainWindow):
         self.tray_menu = menu
 
         self.show_window_action = QAction(
-            lucide_icon("panel-top-open", ACCENT_COLOR), "显示主窗口", self
+            self._icon("panel-top-open", "accent"), "显示主窗口", self
         )
         self.show_window_action.triggered.connect(self._show_from_tray)
         menu.addAction(self.show_window_action)
         menu.addSeparator()
 
         self.auto_sync_action = QAction(
-            lucide_icon("refresh-cw", ACCENT_COLOR), "自动同步", self
+            self._icon("refresh-cw", "accent"), "自动同步", self
         )
         self.auto_sync_action.setCheckable(True)
         self.auto_sync_action.setChecked(self.config.auto_sync_enabled)
@@ -473,30 +595,68 @@ class MainWindow(QMainWindow):
         menu.addAction(self.auto_sync_action)
 
         self.stop_sync_action = QAction(
-            lucide_icon("square", DANGER_COLOR), "停止同步", self
+            self._icon("square", "danger"), "停止同步", self
         )
         self.stop_sync_action.triggered.connect(self.stop_all_sync)
         menu.addAction(self.stop_sync_action)
         menu.addSeparator()
 
         self.floating_window_action = QAction(
-            lucide_icon("picture-in-picture-2", ICON_COLOR), "显示悬浮窗", self
+            self._icon("picture-in-picture-2"), "显示悬浮窗", self
         )
         self.floating_window_action.setCheckable(True)
         self.floating_window_action.setChecked(self.config.floating_window_enabled)
         self.floating_window_action.toggled.connect(self._set_floating_window)
         menu.addAction(self.floating_window_action)
+        # The window is normally hidden, so the tray menu is the only surface
+        # some of this machine's operators ever see.  A theme reachable only from
+        # a settings page they never open is a theme they do not have.
+        menu.addMenu(self._build_theme_menu(menu))
         menu.addSeparator()
 
-        exit_action = QAction(lucide_icon("power", DANGER_COLOR), "退出客户端", self)
-        exit_action.triggered.connect(self._exit_from_tray)
-        menu.addAction(exit_action)
+        self.exit_action = QAction(self._icon("power", "danger"), "退出客户端", self)
+        self.exit_action.triggered.connect(self._exit_from_tray)
+        menu.addAction(self.exit_action)
 
         tray.setContextMenu(menu)
         tray.activated.connect(self._on_tray_activated)
         tray.show()
         self.tray_icon = tray
         self._update_tray_state()
+
+    def _build_theme_menu(self, parent: QMenu) -> QMenu:
+        menu = QMenu("界面主题", parent)
+        menu.setIcon(self._icon("palette"))
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        for theme in THEMES.values():
+            action = QAction(
+                self._icon(
+                    "check" if theme.name == self.theme.name else "circle", "accent"
+                ),
+                theme.label,
+                self,
+            )
+            action.setCheckable(True)
+            action.setChecked(theme.name == self.theme.name)
+            action.setToolTip(theme.caption)
+            # triggered, not toggled: setChecked() from elsewhere must not look
+            # like the user asking for a switch.
+            action.triggered.connect(lambda _checked=False, name=theme.name: self.set_theme(name))
+            group.addAction(action)
+            menu.addAction(action)
+            self._theme_actions[theme.name] = action
+        self.theme_menu = menu
+        return menu
+
+    def _sync_theme_controls(self) -> None:
+        """Point every switch at the theme that is actually on."""
+        index = self.theme_input.findData(self.theme.name)
+        if index >= 0 and index != self.theme_input.currentIndex():
+            self.theme_input.setCurrentIndex(index)
+        self.theme_caption.setText(self.theme.caption)
+        for name, action in self._theme_actions.items():
+            action.setChecked(name == self.theme.name)
 
     def _show_tray_menu_at(self, position: QPoint) -> None:
         if self.tray_menu is None:
@@ -652,25 +812,31 @@ class MainWindow(QMainWindow):
             app.quit()
 
     def _build_top_bar(self) -> QWidget:
+        metrics = self.theme.metrics
         top_bar = QFrame()
         top_bar.setObjectName("appHeader")
-        top_bar.setFixedHeight(62)
+        top_bar.setFixedHeight(metrics.top_bar_height)
         layout = QHBoxLayout(top_bar)
-        layout.setContentsMargins(20, 0, 18, 0)
-        layout.setSpacing(6)
+        layout.setContentsMargins(*metrics.top_bar_margins)
+        layout.setSpacing(metrics.top_bar_spacing)
         title = QLabel("SMSI 归档同步")
         title.setObjectName("brandTitle")
         layout.addWidget(title)
-        layout.addSpacing(24)
+        layout.addSpacing(metrics.top_bar_gap)
+        self.top_bar = top_bar
+        self.top_bar_layout = layout
+        # addSpacing leaves a spacer item behind that a later theme has to be
+        # able to resize; itemAt is how it is found again.
+        self.top_bar_spacer = layout.itemAt(layout.count() - 1)
         self.sync_nav = QPushButton("归档同步")
         self.sync_nav.setObjectName("topTab")
         self.sync_nav.setCheckable(True)
         self.sync_nav.setChecked(True)
-        self.sync_nav.setIcon(lucide_icon("folder-sync", ACCENT_COLOR))
+        self.sync_nav.setIcon(self._icon("folder-sync", "accent"))
         self.settings_nav = QPushButton("设置")
         self.settings_nav.setObjectName("topTab")
         self.settings_nav.setCheckable(True)
-        self.settings_nav.setIcon(lucide_icon("settings", ICON_COLOR))
+        self.settings_nav.setIcon(self._icon("settings"))
         self.sync_nav.clicked.connect(lambda: self._set_page(0))
         self.settings_nav.clicked.connect(lambda: self._set_page(1))
         layout.addWidget(self.sync_nav)
@@ -685,11 +851,11 @@ class MainWindow(QMainWindow):
         self.pages.setCurrentIndex(index)
         self.sync_nav.setChecked(index == 0)
         self.settings_nav.setChecked(index == 1)
-        self.sync_nav.setIcon(lucide_icon(
-            "folder-sync", ACCENT_COLOR if index == 0 else ICON_COLOR
+        self.sync_nav.setIcon(self._icon(
+            "folder-sync", "accent" if index == 0 else "icon"
         ))
-        self.settings_nav.setIcon(lucide_icon(
-            "settings", ACCENT_COLOR if index == 1 else ICON_COLOR
+        self.settings_nav.setIcon(self._icon(
+            "settings", "accent" if index == 1 else "icon"
         ))
 
     def _page_header(self, title: str, caption: str) -> tuple[QWidget, QHBoxLayout]:
@@ -711,18 +877,19 @@ class MainWindow(QMainWindow):
     def _build_sync_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(20, 16, 20, 14)
-        layout.setSpacing(12)
+        layout.setContentsMargins(*self.theme.metrics.page_margins)
+        layout.setSpacing(self.theme.metrics.page_spacing)
+        self._page_layouts.append(layout)
         header, actions = self._page_header("归档文件", f"Ubuntu  {REMOTE_ROOT}")
         self.refresh_button = QPushButton("刷新")
         self.refresh_button.setObjectName("toolbarButton")
-        self.refresh_button.setIcon(lucide_icon("refresh-cw"))
+        self.refresh_button.setIcon(self._icon("refresh-cw"))
         self.sync_button = QPushButton("同步可用归档")
         self.sync_button.setObjectName("primaryButton")
-        self.sync_button.setIcon(lucide_icon("download", "#ffffff"))
+        self.sync_button.setIcon(self._icon("download", "on_accent"))
         self.verify_button = QPushButton("校验选中")
         self.verify_button.setObjectName("toolbarButton")
-        self.verify_button.setIcon(lucide_icon("shield-check", ACCENT_COLOR))
+        self.verify_button.setIcon(self._icon("shield-check", "accent"))
         actions.addWidget(self.refresh_button)
         actions.addWidget(self.verify_button)
         actions.addWidget(self.sync_button)
@@ -736,92 +903,132 @@ class MainWindow(QMainWindow):
         self.tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
         self.tree.setUniformRowHeights(True)
         self.tree.setAnimated(False)
-        self.tree.setIconSize(QSize(18, 18))
         header_view = self.tree.header()
         header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         # The last column is a fixed-shape sentence, the name column is the one
         # that grows without limit, so let the name take the spare width.
         header_view.setStretchLastSection(False)
-        column_widths = {1: 86, 2: 90, 3: 90, 4: 70, 5: 122, 6: 220}
-        # A pinned width is a bet that the heading fits inside it, and two of
-        # these lost it: "Ubuntu 状态" rendered as "Ubuntu 状".  Measure the
-        # heading and keep the wider of the two, so a font or a display scale
-        # the numbers were never chosen for cannot cut a column title in half.
-        #
-        # Polish first.  A fresh header still carries the 9pt default font, and
-        # the stylesheet's 10pt only arrives with the polish, so measuring too
-        # early asks the wrong font and comes back 10% short - which is how much
-        # of the heading then went missing.
-        header_view.ensurePolished()
-        metrics = QFontMetrics(header_view.font())
-        for column, width in column_widths.items():
-            heading = self.tree.headerItem().text(column)
-            # 8px of section padding on each side, 1px separator, and the
-            # headings are drawn semi-bold while the metrics are not.
-            needed = int(metrics.horizontalAdvance(heading) * 1.08) + 18
-            header_view.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
-            header_view.resizeSection(column, max(width, needed))
-        header_view.setMinimumSectionSize(64)
+        self._apply_tree_metrics()
         layout.addWidget(self.tree, 1)
         layout.addWidget(self._build_task_bar())
         return page
 
+    def _apply_tree_metrics(self) -> None:
+        """Column widths, icon size and the smallest a column may be dragged to.
+
+        A pinned width is a bet that the heading fits inside it, and two of the
+        original numbers lost it: "Ubuntu 状态" rendered as "Ubuntu 状".  Each
+        column takes the wider of its theme's number and its own measured
+        heading, so neither a larger theme font nor a display scale nobody chose
+        these numbers for can cut a column title in half.
+
+        Polish first.  A fresh header still carries Qt's 9pt default, and the
+        stylesheet's size only arrives with the polish, so measuring too early
+        asks the wrong font and comes back short - which is how much of the
+        heading then went missing.
+        """
+        metrics = self.theme.metrics
+        self.tree.setIconSize(QSize(metrics.tree_icon, metrics.tree_icon))
+        header_view = self.tree.header()
+        header_view.ensurePolished()
+        font_metrics = QFontMetrics(header_view.font())
+        for column, width in metrics.tree_columns:
+            heading = self.tree.headerItem().text(column)
+            # 8px of section padding on each side, 1px separator, and the
+            # headings are drawn semi-bold while the metrics are not.
+            needed = int(font_metrics.horizontalAdvance(heading) * 1.08) + 18
+            header_view.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
+            header_view.resizeSection(column, max(width, needed))
+        header_view.setMinimumSectionSize(metrics.tree_min_section)
+
     def _build_summary_bar(self) -> QWidget:
         frame = QFrame()
         frame.setObjectName("summaryBar")
-        layout = QHBoxLayout(frame)
-        layout.setContentsMargins(14, 11, 14, 11)
-        # Eight readings and seven dividers: at 14px every gap, the spacing alone
-        # was a fifth of the bar and the strip could not fit inside the window's
-        # own minimum width.
-        layout.setSpacing(12)
-        self.connection_label = self._metric(layout, "连接", "未检查", 104)
-        self._metric_divider(layout)
-        self.ready_label = self._metric(layout, "可同步日期", "0", 76)
-        self._metric_divider(layout)
-        self.pending_label = self._metric(layout, "待同步数据", "0 B", 100)
-        self._metric_divider(layout)
-        self.disk_label = self._metric(layout, "归档盘可用", "--", 100)
-        self._metric_divider(layout)
-        self.verified_label = self._metric(layout, "本地已验证", "0", 88)
-        self._metric_divider(layout)
-        self.continuity_label = self._metric(layout, "连续完整", "0 天", 82)
-        self._metric_divider(layout)
-        self.gap_label = self._metric(layout, "日期缺口", "0", 72)
-        self._metric_divider(layout)
-        self.last_scan_label = self._metric(layout, "最近扫描", "--", 104)
-        layout.addStretch(1)
+        # A grid rather than a row of boxes: this is the one part of the window a
+        # theme is allowed to reshape, and reflowing eight readings from one long
+        # strip into a 4x2 board must not mean deleting and rebuilding the labels
+        # that other code already holds references to.
+        grid = QGridLayout(frame)
+        self._summary_grid = grid
+        self.connection_label = self._metric("连接", "未检查")
+        self.ready_label = self._metric("可同步日期", "0")
+        self.pending_label = self._metric("待同步数据", "0 B")
+        self.disk_label = self._metric("归档盘可用", "--")
+        self.verified_label = self._metric("本地已验证", "0")
+        self.continuity_label = self._metric("连续完整", "0 天")
+        self.gap_label = self._metric("日期缺口", "0")
+        self.last_scan_label = self._metric("最近扫描", "--")
+        for _ in range(len(self._summary_cells) - 1):
+            divider = QFrame(frame)
+            divider.setObjectName("metricDivider")
+            self._summary_dividers.append(divider)
+        self._arrange_summary()
         return frame
 
-    def _metric(
-        self, layout: QHBoxLayout, label: str, value: str, minimum_width: int
-    ) -> QLabel:
+    def _metric(self, label: str, value: str) -> QLabel:
         widget = QWidget()
-        widget.setMinimumWidth(minimum_width)
         box = QVBoxLayout(widget)
         box.setContentsMargins(0, 0, 0, 0)
-        box.setSpacing(1)
         value_label = QLabel(value)
         value_label.setObjectName("metricValue")
         label_widget = QLabel(label)
         label_widget.setObjectName("metricLabel")
         box.addWidget(value_label)
         box.addWidget(label_widget)
-        layout.addWidget(widget)
+        self._summary_cells.append(widget)
+        self._summary_boxes.append(box)
         return value_label
 
-    def _metric_divider(self, layout: QHBoxLayout) -> None:
-        divider = QFrame()
-        divider.setObjectName("metricDivider")
-        divider.setFixedSize(1, 42)
-        layout.addWidget(divider)
+    def _arrange_summary(self) -> None:
+        """Place the readings for the current theme.
+
+        Eight readings in one row with a hairline between each is a dense
+        administrative strip; the same eight in four columns and two rows, each
+        reading twice the point size and no rules between them, is a board.  Same
+        widgets, same numbers, and the difference is legible from the doorway.
+        """
+        metrics = self.theme.metrics
+        grid = self._summary_grid
+        grid.setContentsMargins(*metrics.summary_margins)
+        grid.setHorizontalSpacing(metrics.summary_spacing)
+        grid.setVerticalSpacing(metrics.summary_row_spacing)
+        for cell in self._summary_cells:
+            grid.removeWidget(cell)
+        for divider in self._summary_dividers:
+            grid.removeWidget(divider)
+        for column in range(grid.columnCount()):
+            grid.setColumnStretch(column, 0)
+        columns = max(1, metrics.summary_columns)
+        # A hairline only separates neighbours in a single row; between the rows
+        # of a board it would be a grid nobody asked for.
+        ruled = metrics.summary_dividers and columns >= len(self._summary_cells)
+        for index, cell in enumerate(self._summary_cells):
+            row, position = divmod(index, columns)
+            grid.addWidget(cell, row, position * 2 if ruled else position)
+            cell.setMinimumWidth(metrics.metric_min_widths[index])
+            self._summary_boxes[index].setSpacing(metrics.metric_gap)
+        for index, divider in enumerate(self._summary_dividers):
+            if ruled:
+                divider.setFixedSize(1, metrics.summary_divider_height)
+                grid.addWidget(divider, 0, index * 2 + 1)
+            divider.setVisible(ruled)
+        if ruled:
+            # One trailing column takes the slack, so the readings stay left and
+            # keep the widths they were given.
+            grid.setColumnStretch(len(self._summary_cells) * 2 - 1, 1)
+        else:
+            # No slack column: the board spreads its columns evenly instead.
+            for column in range(columns):
+                grid.setColumnStretch(column, 1)
 
     def _build_task_bar(self) -> QWidget:
+        metrics = self.theme.metrics
         frame = QFrame()
         frame.setObjectName("taskBar")
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(14, 9, 14, 9)
-        layout.setSpacing(6)
+        layout.setContentsMargins(*metrics.task_margins)
+        layout.setSpacing(metrics.task_spacing)
+        self.task_layout = layout
         top = QHBoxLayout()
         self.task_title = QLabel("空闲")
         self.task_title.setObjectName("sectionTitle")
@@ -830,9 +1037,9 @@ class MainWindow(QMainWindow):
         self.task_detail.setMinimumWidth(0)
         self.cancel_button = QPushButton("取消")
         self.cancel_button.setObjectName("dangerButton")
-        self.cancel_button.setIcon(lucide_icon("x", DANGER_COLOR))
+        self.cancel_button.setIcon(self._icon("x", "danger"))
         self.cancel_button.setEnabled(False)
-        self.cancel_button.setFixedWidth(82)
+        self.cancel_button.setFixedWidth(metrics.cancel_width)
         top.addWidget(self.task_title)
         top.addSpacing(10)
         top.addWidget(self.task_detail, 1)
@@ -846,16 +1053,18 @@ class MainWindow(QMainWindow):
         return frame
 
     def _build_settings_page(self) -> QWidget:
+        metrics = self.theme.metrics
         page = QWidget()
         outer = QVBoxLayout(page)
-        outer.setContentsMargins(20, 16, 20, 14)
-        outer.setSpacing(12)
+        outer.setContentsMargins(*metrics.page_margins)
+        outer.setSpacing(metrics.page_spacing)
+        self._page_layouts.append(outer)
         header, actions = self._page_header("客户端设置", "Ubuntu 连接、Windows 存储与传输限制")
         self.test_button = QPushButton("测试连接")
-        self.test_button.setIcon(lucide_icon("plug-zap", ACCENT_COLOR))
+        self.test_button.setIcon(self._icon("plug-zap", "accent"))
         self.save_button = QPushButton("保存")
         self.save_button.setObjectName("primaryButton")
-        self.save_button.setIcon(lucide_icon("save", "#ffffff"))
+        self.save_button.setIcon(self._icon("save", "on_accent"))
         actions.addWidget(self.test_button)
         actions.addWidget(self.save_button)
         outer.addWidget(header)
@@ -863,14 +1072,17 @@ class MainWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         content = QWidget()
-        content.setMaximumWidth(840)
+        content.setMaximumWidth(metrics.content_max_width)
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(0, 0, 8, 0)
-        content_layout.setSpacing(12)
+        content_layout.setSpacing(metrics.page_spacing)
+        self.settings_content = content
+        self.settings_content_layout = content_layout
         content_layout.addWidget(self._connection_section())
         content_layout.addWidget(self._storage_section())
         content_layout.addWidget(self._transfer_section())
         content_layout.addWidget(self._alert_section())
+        content_layout.addWidget(self._appearance_section())
         content_layout.addStretch(1)
         self._align_form_labels()
         scroll.setWidget(content)
@@ -880,17 +1092,48 @@ class MainWindow(QMainWindow):
 
     def _settings_form(self) -> QFormLayout:
         form = QFormLayout()
-        form.setHorizontalSpacing(18)
-        form.setVerticalSpacing(9)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self._forms.append(form)
+        self._apply_form_metrics(form)
         return form
+
+    def _apply_form_metrics(self, form: QFormLayout) -> None:
+        """The spacings and the row shape, both of which a theme owns.
+
+        Wrapping every row puts the label on its own line above its field.  That
+        is what lets a wider control and a larger font still fit a page narrower
+        than this one, and it is why the label column is not measured at all in a
+        theme that wraps.
+        """
+        metrics = self.theme.metrics
+        form.setHorizontalSpacing(metrics.form_h_spacing)
+        form.setVerticalSpacing(metrics.form_v_spacing)
+        form.setLabelAlignment(self._form_label_alignment())
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setRowWrapPolicy(
+            QFormLayout.RowWrapPolicy.WrapAllRows
+            if metrics.form_wrap_rows
+            else QFormLayout.RowWrapPolicy.DontWrapRows
+        )
+
+    def _form_label_alignment(self) -> Qt.AlignmentFlag:
+        horizontal = (
+            Qt.AlignmentFlag.AlignRight
+            if self.theme.metrics.label_align_right
+            else Qt.AlignmentFlag.AlignLeft
+        )
+        return horizontal | Qt.AlignmentFlag.AlignVCenter
 
     def _form_row(self, form: QFormLayout, text: str, field: QWidget) -> None:
         label = QLabel(text)
-        label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        label.setAlignment(self._form_label_alignment())
         self._form_labels.append(label)
         form.addRow(label, field)
+
+    def _sized_input(self, widget: QWidget, kind: str) -> QWidget:
+        """Register a control whose width is a theme number, and apply it now."""
+        self._sized_inputs.append((widget, kind))
+        widget.setFixedWidth(getattr(self.theme.metrics, f"{kind}_width"))
+        return widget
 
     def _align_form_labels(self) -> None:
         """One label column for the whole page, not one per card.
@@ -899,9 +1142,18 @@ class MainWindow(QMainWindow):
         card whose longest label was three characters put its inputs 26px left
         of the card below it.  Measured after polishing because the point size
         arrives with the stylesheet, not with the widget.
+
+        A theme that stacks its labels above its fields has no column to share,
+        so the minimum is released rather than left behind as blank padding.
         """
+        alignment = self._form_label_alignment()
         for label in self._form_labels:
+            label.setAlignment(alignment)
             label.ensurePolished()
+        if self.theme.metrics.form_wrap_rows:
+            for label in self._form_labels:
+                label.setMinimumWidth(0)
+            return
         widest = max(
             [label.sizeHint().width() for label in self._form_labels]
             + [QFontMetrics(self.font()).horizontalAdvance(FORM_LABEL_SAMPLE)]
@@ -913,8 +1165,9 @@ class MainWindow(QMainWindow):
         frame = QFrame()
         frame.setObjectName("settingsSection")
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(18, 14, 18, 16)
-        layout.setSpacing(10)
+        layout.setContentsMargins(*self.theme.metrics.card_margins)
+        layout.setSpacing(self.theme.metrics.card_spacing)
+        self._card_layouts.append(layout)
         heading = QLabel(title)
         heading.setObjectName("sectionTitle")
         caption = QLabel(description)
@@ -929,7 +1182,7 @@ class MainWindow(QMainWindow):
         self.host_input = QLineEdit()
         self.port_input = QSpinBox()
         self.port_input.setRange(1, 65535)
-        self.port_input.setFixedWidth(106)
+        self._sized_input(self.port_input, "port")
         self.username_input = QLineEdit()
         self.remote_root_input = QLineEdit(REMOTE_ROOT)
         self.remote_root_input.setReadOnly(True)
@@ -967,15 +1220,16 @@ class MainWindow(QMainWindow):
         row_layout.setContentsMargins(0, 0, 0, 0)
         row_layout.setSpacing(8)
         button = QPushButton("选择")
-        button.setFixedWidth(88)
-        button.setIcon(lucide_icon("folder-open"))
+        self.browse_button = button
+        self._sized_input(button, "browse")
+        button.setIcon(self._icon("folder-open"))
         button.clicked.connect(self._choose_local_root)
         row_layout.addWidget(self.local_root_input, 1)
         row_layout.addWidget(button)
         self.reserve_input = QSpinBox()
         self.reserve_input.setRange(1, 1024)
         self.reserve_input.setSuffix(" GiB")
-        self.reserve_input.setFixedWidth(126)
+        self._sized_input(self.reserve_input, "number")
         self._form_row(form, "本地归档目录", row)
         self._form_row(form, "磁盘保留空间", self.reserve_input)
         layout.addLayout(form)
@@ -986,9 +1240,9 @@ class MainWindow(QMainWindow):
         form = self._settings_form()
         self.workers_input = QSpinBox()
         self.workers_input.setRange(1, 4)
-        self.workers_input.setFixedWidth(126)
+        self._sized_input(self.workers_input, "number")
         self.bandwidth_input = QComboBox()
-        self.bandwidth_input.setFixedWidth(160)
+        self._sized_input(self.bandwidth_input, "choice")
         for label, value in (("不限速", 0), ("5 MiB/s", 5), ("10 MiB/s", 10), ("20 MiB/s", 20), ("50 MiB/s", 50)):
             self.bandwidth_input.addItem(label, value)
         self._form_row(form, "并发任务", self.workers_input)
@@ -1002,7 +1256,7 @@ class MainWindow(QMainWindow):
         )
         form = self._settings_form()
         self.alert_enabled_input = QComboBox()
-        self.alert_enabled_input.setFixedWidth(160)
+        self._sized_input(self.alert_enabled_input, "choice")
         self.alert_enabled_input.addItem("关闭", False)
         self.alert_enabled_input.addItem("开启", True)
         self.alert_token_input = QLineEdit()
@@ -1011,19 +1265,19 @@ class MainWindow(QMainWindow):
         self.alert_chat_input = QLineEdit()
         self.alert_chat_input.setPlaceholderText("例如 -1001234567890")
         self.alert_level_input = QComboBox()
-        self.alert_level_input.setFixedWidth(160)
+        self._sized_input(self.alert_level_input, "choice")
         self.alert_level_input.addItem("警告及以上", "warning")
         self.alert_level_input.addItem("仅错误", "error")
         self.alert_stale_input = QSpinBox()
         self.alert_stale_input.setRange(1, 168)
         self.alert_stale_input.setSuffix(" 小时")
-        self.alert_stale_input.setFixedWidth(126)
+        self._sized_input(self.alert_stale_input, "number")
         self.alert_lag_input = QSpinBox()
         self.alert_lag_input.setRange(2, 14)
         self.alert_lag_input.setSuffix(" 天")
-        self.alert_lag_input.setFixedWidth(126)
+        self._sized_input(self.alert_lag_input, "number")
         self.alert_test_button = QPushButton("发送测试消息")
-        self.alert_test_button.setIcon(lucide_icon("send", ACCENT_COLOR))
+        self.alert_test_button.setIcon(self._icon("send", "accent"))
         test_row = QWidget()
         test_layout = QHBoxLayout(test_row)
         test_layout.setContentsMargins(0, 0, 0, 0)
@@ -1042,6 +1296,36 @@ class MainWindow(QMainWindow):
         self.alert_health_label.setWordWrap(True)
         layout.addWidget(self.alert_health_label)
         return frame
+
+    def _appearance_section(self) -> QWidget:
+        frame, layout = self._section(
+            "界面主题", "主题同时决定配色和排版；切换立即生效，不需要重启"
+        )
+        form = self._settings_form()
+        self.theme_input = QComboBox()
+        self._sized_input(self.theme_input, "choice")
+        for theme in THEMES.values():
+            self.theme_input.addItem(theme.label, theme.name)
+        self.theme_input.setCurrentIndex(
+            max(0, self.theme_input.findData(self.theme.name))
+        )
+        # Applied on selection rather than on 保存: a theme is judged by looking
+        # at it, and a preview you have to commit to is not a preview.  It is
+        # written to the config file the same moment, the way the tray toggles
+        # are, so the choice survives a restart without touching the form below.
+        self.theme_input.currentIndexChanged.connect(self._on_theme_selected)
+        self._form_row(form, "主题", self.theme_input)
+        layout.addLayout(form)
+        self.theme_caption = QLabel(self.theme.caption)
+        self.theme_caption.setObjectName("sectionDescription")
+        self.theme_caption.setWordWrap(True)
+        layout.addWidget(self.theme_caption)
+        return frame
+
+    def _on_theme_selected(self, index: int) -> None:
+        name = self.theme_input.itemData(index)
+        if isinstance(name, str):
+            self.set_theme(name)
 
     def _connect_signals(self) -> None:
         self.refresh_button.clicked.connect(self.start_scan)
@@ -1131,6 +1415,10 @@ class MainWindow(QMainWindow):
             alert_min_level=str(self.alert_level_input.currentData()),
             alert_stale_hours=self.alert_stale_input.value(),
             alert_upstream_lag_days=self.alert_lag_input.value(),
+            # Applied and stored the moment it is picked, so the form must carry
+            # the live value forward - saving the page must not quietly undo a
+            # theme chosen from the tray a minute ago.
+            theme=self.config.theme,
         )
         config.set_password(self.password_input.text())
         token = validate_alert_token(self.alert_token_input.text())
@@ -1494,7 +1782,7 @@ class MainWindow(QMainWindow):
             day_item.setText(3, bytes_text(day.bytes_total))
             self._set_tree_progress(day_item, 100, verified=True)
             day_item.setText(5, f"{verification_label}通过")
-            day_item.setIcon(0, lucide_icon("folder-check", SUCCESS_COLOR))
+            day_item.setIcon(0, self._icon("folder-check", "icon_success"))
             day_item.setForeground(5, self._status_color("verified"))
             for obj in day.objects:
                 obj.local_bytes = obj.size_bytes
@@ -1622,12 +1910,19 @@ class MainWindow(QMainWindow):
         ))
 
     def _status_color(self, status: str) -> QColor:
+        """The colour a status word is painted in, from the active palette.
+
+        Tree item foregrounds are painted, not styled: a stylesheet cannot reach
+        them, so these are the one set of colours that has to be looked up by
+        hand on every render.
+        """
+        colours = self.theme.palette
         if status == "verified":
-            return QColor("#157347")
+            return QColor(colours.success)
         if status in {"ready", "syncing", "verifying"}:
-            return QColor("#0f6cbd")
+            return QColor(colours.accent)
         if status in {"remote_running", "waiting_manifest", "waiting_verification", "partial"}:
-            return QColor("#9a6700")
+            return QColor(colours.warning)
         if status in {
             "remote_failed",
             "invalid",
@@ -1636,8 +1931,8 @@ class MainWindow(QMainWindow):
             "manifest_changed",
             "error",
         }:
-            return QColor(DANGER_COLOR)
-        return QColor("#6b6b72")
+            return QColor(colours.danger)
+        return QColor(colours.muted)
 
     def _day_display_status(self, day: ArchiveDay) -> tuple[str, str]:
         if day.remote_status == "ready":
@@ -1657,7 +1952,7 @@ class MainWindow(QMainWindow):
             self._tree_file_items.clear()
             root = QTreeWidgetItem([f"Ubuntu  {catalog.remote_root}", "", "", "", "", "", ""])
             root.setData(0, NODE_ROLE, {"kind": "root"})
-            root.setIcon(0, lucide_icon("server", ACCENT_COLOR))
+            root.setIcon(0, self._icon("server", "accent"))
             self.tree.addTopLevelItem(root)
             groups: dict[str, list[ArchiveDay]] = defaultdict(list)
             for day in catalog.days:
@@ -1666,7 +1961,7 @@ class MainWindow(QMainWindow):
                 days = sorted(groups[collector_id], key=lambda value: value.archive_date, reverse=True)
                 collector = QTreeWidgetItem(root, [f"collector={collector_id}"])
                 collector.setData(0, NODE_ROLE, {"kind": "collector", "collector_id": collector_id})
-                collector.setIcon(0, lucide_icon("database", ICON_COLOR))
+                collector.setIcon(0, self._icon("database"))
                 for day in days:
                     status_code, status_label = self._day_display_status(day)
                     if day.local_status == "verified":
@@ -1697,9 +1992,9 @@ class MainWindow(QMainWindow):
                     item.setData(0, NODE_ROLE, {
                         "kind": "day", "day_key": day.key, "files_loaded": False
                     })
-                    item.setIcon(0, lucide_icon(
+                    item.setIcon(0, self._icon(
                         "folder-check" if day.local_status == "verified" else "folder",
-                        SUCCESS_COLOR if day.local_status == "verified" else ICON_COLOR,
+                        "icon_success" if day.local_status == "verified" else "icon",
                     ))
                     item.setForeground(1, self._status_color(status_code))
                     item.setForeground(5, self._status_color(verification_code))
@@ -1758,7 +2053,7 @@ class MainWindow(QMainWindow):
             manifest = QTreeWidgetItem(parent, [
                 "manifest.json", "已发布", bytes_text(len(day.manifest_raw)), "--", "--", "协议有效", "--"
             ])
-            manifest.setIcon(0, lucide_icon("file-check", ACCENT_COLOR))
+            manifest.setIcon(0, self._icon("file-check", "accent"))
             manifest.setData(0, NODE_ROLE, {"kind": "file", "day_key": day.key, "path": "manifest.json"})
             manifest.setForeground(5, self._status_color("verified"))
             manifest.setToolTip(5, f"SHA-256: {day.manifest_sha256}")
@@ -1770,7 +2065,7 @@ class MainWindow(QMainWindow):
                 current_path = f"{current_path}/{directory}".strip("/")
                 if current_path not in directory_items:
                     directory_item = QTreeWidgetItem(current_parent, [directory])
-                    directory_item.setIcon(0, lucide_icon("folder", ICON_COLOR))
+                    directory_item.setIcon(0, self._icon("folder"))
                     directory_item.setData(0, NODE_ROLE, {
                         "kind": "directory", "day_key": day.key, "path": current_path
                     })
@@ -1789,9 +2084,8 @@ class MainWindow(QMainWindow):
                 "通过" if day.local_status == "verified" else "待校验",
                 "--",
             ])
-            file_item.setIcon(0, lucide_icon(
+            file_item.setIcon(0, self._icon(
                 "table-properties" if obj.item_format == "parquet" else "file-text",
-                ICON_COLOR,
             ))
             file_item.setData(0, NODE_ROLE, {
                 "kind": "file", "day_key": day.key, "path": obj.relative_key
@@ -1851,12 +2145,12 @@ class MainWindow(QMainWindow):
         status = disk_status(self.config.local_root, self.config.minimum_free_gib)
         if not status["ok"]:
             self.disk_label.setText("无法读取")
-            self.disk_label.setStyleSheet(f"color: {DANGER_COLOR}")
+            self.disk_label.setStyleSheet(f"color: {self.theme.palette.danger}")
             self.disk_label.setToolTip(f"无法读取归档盘：{status['error']}")
             return
         self.disk_label.setText(bytes_text(status["free_bytes"]))
         self.disk_label.setStyleSheet(
-            f"color: {DANGER_COLOR}" if status["low"] else ""
+            f"color: {self.theme.palette.danger}" if status["low"] else ""
         )
         self.disk_label.setToolTip(
             f"归档盘共 {bytes_text(status['total_bytes'])}，"
