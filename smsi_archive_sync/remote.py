@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import posixpath
+import re
 import shlex
 import socket
 import stat
@@ -150,6 +151,22 @@ class RemoteArchiveClient:
         if len(payload) > maximum_bytes:
             raise RuntimeError(f"Ubuntu 文件超过安全大小: {path}")
         return bytes(payload)
+
+    def list_delivery_files(self, path: str) -> list[str]:
+        try:
+            items = self._require_sftp().listdir_attr(path)
+        except FileNotFoundError:
+            return []
+        if len(items) > 10_000:
+            raise RuntimeError("补充包发布清单超过数量限制")
+        result = []
+        for item in items:
+            if not stat.S_ISREG(item.st_mode):
+                raise RuntimeError("补充包发布目录包含非普通文件")
+            if re.fullmatch(r"[0-9]{20}-[0-9a-f]{64}\.json\.[0-9a-f]{32}\.tmp", item.filename):
+                continue  # Ubuntu's atomic writer has not published this file.
+            result.append(item.filename)
+        return result
 
     def download(
         self,

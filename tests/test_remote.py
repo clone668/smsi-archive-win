@@ -1,12 +1,32 @@
 from __future__ import annotations
 
 import re
+import stat
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
 
+import pytest
+
 from smsi_archive_sync.config import AppConfig
 from smsi_archive_sync.remote import BandwidthLimiter, RemoteArchiveClient
+
+
+def test_supplement_inventory_rejects_links_and_access_errors():
+    client = RemoteArchiveClient(AppConfig())
+    name = "00000000000000000001-" + "a" * 64 + ".json"
+    client.sftp = SimpleNamespace(listdir_attr=lambda _: [
+        SimpleNamespace(filename=name, st_mode=stat.S_IFREG),
+        SimpleNamespace(filename=name + "." + "b" * 32 + ".tmp", st_mode=stat.S_IFREG)])
+    assert client.list_delivery_files("/archive/dependencies-v1/deliveries") == [name]
+    client.sftp.listdir_attr = lambda _: [SimpleNamespace(filename=name, st_mode=stat.S_IFLNK)]
+    with pytest.raises(RuntimeError, match="非普通文件"):
+        client.list_delivery_files("/archive/dependencies-v1/deliveries")
+    def fail(_):
+        raise PermissionError("denied")
+    client.sftp.listdir_attr = fail
+    with pytest.raises(PermissionError):
+        client.list_delivery_files("/archive/dependencies-v1/deliveries")
 
 
 class FakeChannel:
