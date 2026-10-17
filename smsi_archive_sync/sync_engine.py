@@ -12,8 +12,6 @@ from typing import Any, Callable
 
 from .config import AppConfig
 from .models import ArchiveDay, RemoteObject
-from .dependencies import DependencyReceiver
-from .dependency_source import DependencySource
 from .protocol import (
     ManifestSnapshot,
     legacy_report_removal_item,
@@ -358,52 +356,12 @@ class SyncEngine:
             f"当前可用 {bytes_text(free)}{hint}"
         )
 
-    def _sync_dependencies(self, day: ArchiveDay) -> dict[str, Any]:
-        entry = day.dependency_summary
-        if not entry.get("catalog_key"):
-            return entry
-        def checkpoint():
-            if self.cancel.is_set():
-                raise OperationCancelled("补充包同步已取消，已完成对象保留")
-        try:
-            checkpoint()
-            with RemoteArchiveClient(self.config) as client:
-                source = DependencySource(client, self.config.remote_root, day.collector_id,
-                    transfer_client=self._client, cancel=self.cancel, limiter=self.limiter)
-                receiver = DependencyReceiver(self.config.local_path / f"collector={day.collector_id}",
-                    day.collector_id, source, checkpoint=checkpoint,
-                    minimum_free_bytes=reserve_bytes(self.config.minimum_free_gib),
-                    workers=self.config.download_workers, require_upstream_receipt=True,
-                    progress=lambda done, total, key: self._emit(phase="supplement",
-                        collector_id=day.collector_id, archive_date=day.archive_date,
-                        bytes_done=done, bytes_total=total, current_object=key))
-                day.dependency_summary = receiver.sync(entry)
-        except OperationCancelled:
-            day.dependency_summary = {**entry, "state": "cancelled"}
-            raise
-        except Exception as exc:
-            day.dependency_summary = {**entry, "state": "error", "error": str(exc)}
-            # Preserve the completed native archive and continue later
-            # dates. The UI reports supplement failures separately.
-        return day.dependency_summary
-
     def sync_day(self, day: ArchiveDay) -> dict[str, Any]:
         if not day.eligible:
             raise RuntimeError(f"{day.key} 当前不可同步")
-        if day.local_status == "verified" and day.dependency_pending:
-            try:
-                summary = self._sync_dependencies(day)
-                return {"status": "verified", "collector_id": day.collector_id,
-                    "archive_date": day.archive_date, "dependency_summary": summary}
-            finally:
-                self.close()
         snapshot = self._snapshot(day)
         migrated = self._migrate_legacy_report_removal(day, snapshot)
         if migrated is not None:
-            try:
-                migrated["dependency_summary"] = self._sync_dependencies(day)
-            finally:
-                self.close()
             return migrated
         final, _stage_path, quarantine = self._roots(day)
         stage = self._prepare_stage(day, snapshot)
@@ -501,7 +459,6 @@ class SyncEngine:
             partial_parent = stage.parent
             if partial_parent.exists() and not any(partial_parent.iterdir()):
                 partial_parent.rmdir()
-            report["dependency_summary"] = self._sync_dependencies(day)
             self._emit(
                 phase="verified",
                 verification_level="transport",
@@ -574,21 +531,6 @@ class SyncEngine:
         })
         write_json_atomic(final / ".smsi-verified.json", report)
         (final / ".smsi-verification-failed.json").unlink(missing_ok=True)
-        def verify_checkpoint():
-            if self.cancel.is_set():
-                raise OperationCancelled("补充包校验已取消")
-        receiver = DependencyReceiver(self.config.local_path / f"collector={day.collector_id}",
-            day.collector_id, None, checkpoint=verify_checkpoint)
-        local_entry = receiver.discover().get((day.archive_date, day.manifest_sha256))
-        if local_entry:
-            try:
-                day.dependency_summary = receiver.verify(local_entry)
-            except OperationCancelled:
-                raise
-            except Exception as exc:
-                day.dependency_summary = {**day.dependency_summary, "state": "error", "error": str(exc)}
-                raise RuntimeError("原日包校验通过，补充包校验失败：" + str(exc)) from exc
-            report["dependency_summary"] = day.dependency_summary
         self._emit(
             phase="verified",
             verification_level="deep",

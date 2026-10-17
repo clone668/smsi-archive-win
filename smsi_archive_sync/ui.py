@@ -38,7 +38,6 @@ from PySide6.QtWidgets import (
 from . import __version__
 from .alerts import AlertNotifier, AlertWorker
 from .config import ALERT_LEVELS, AppConfig, ConfigStore, REMOTE_ROOT, validate_alert_token
-from .dependencies import summary_label
 from .icons import lucide_icon
 from .models import ArchiveCatalog, ArchiveDay, RemoteObject, STATUS_LABELS
 from .remote import HostKeyRequired, RemoteArchiveClient
@@ -137,24 +136,8 @@ def archive_content_text(day: ArchiveDay) -> str:
         1 for obj in day.objects if obj.kind == "business"
     )
     if business_tables or business_rows:
-        content = f"{business_tables:,} 业务表 · {compact_count(business_rows)} 业务记录"
-    else:
-        content = f"{day.object_count:,} 文件 · {compact_count(day.row_count)} 归档总行数"
-    supplement = day.dependency_summary
-    if not supplement:
-        return content
-    label = {
-        "verified": "补包已验证" + (" · 材料缺项" if supplement.get("dependency_status") == "partial" else ""),
-        "unpublished": "补包未发布", "ready": "补包待下载",
-        "waiting_native": "补包等待原日包", "error": "补包检查失败",
-        "cancelled": "补包待续传",
-    }.get(supplement.get("state"), "补包待检查")
-    return label + " · " + content
-
-
-def pending_transfer_bytes(day: ArchiveDay) -> int:
-    return max(0, day.bytes_total - day.bytes_local) + (
-        int(day.dependency_summary.get("bytes_total") or 0) if day.dependency_pending else 0)
+        return f"{business_tables:,} 业务表 · {compact_count(business_rows)} 业务记录"
+    return f"{day.object_count:,} 文件 · {compact_count(day.row_count)} 归档总行数"
 
 
 def archive_continuity(days: list[ArchiveDay]) -> tuple[int, int]:
@@ -203,9 +186,7 @@ def automatic_sync_days(
         if not day.eligible:
             continue
         try:
-            if date.fromisoformat(day.archive_date) < cutoff and not (
-                day.local_status == "verified" and day.dependency_pending
-            ):
+            if date.fromisoformat(day.archive_date) < cutoff:
                 continue
         except ValueError:
             continue
@@ -1576,7 +1557,7 @@ class MainWindow(QMainWindow):
         if not days:
             QMessageBox.information(self, "没有可同步内容", "选中范围内没有已经通过 Ubuntu 验证的待同步归档。")
             return
-        total = sum(pending_transfer_bytes(day) for day in days)
+        total = sum(day.bytes_total - day.bytes_local for day in days)
         scope_note = (
             "将同步选中的历史归档。"
             if explicitly_selected
@@ -1677,16 +1658,6 @@ class MainWindow(QMainWindow):
 
     def _on_progress(self, payload: dict[str, Any]) -> None:
         phase = str(payload.get("phase") or "")
-        if phase == "supplement":
-            total = int(payload.get("bytes_total") or 0)
-            done = int(payload.get("bytes_done") or 0)
-            self.task_title.setText(f"正在同步补充包 {payload.get('archive_date', '')}")
-            self.task_detail.setText(f"{payload.get('collector_id', '')} · {bytes_text(done)} / {bytes_text(total)}")
-            self.task_progress.setRange(0, 1000)
-            self.task_progress.setValue(int(done * 1000 / total) if total else 0)
-            self.floating_window.set_status(self.task_title.text(), self.task_detail.text(),
-                self.task_progress.value(), "自动" if self.config.auto_sync_enabled else "同步")
-            return
         if phase == "scanning":
             current, total = int(payload.get("current") or 0), int(payload.get("total") or 0)
             self.task_title.setText("扫描 Ubuntu")
@@ -1868,18 +1839,6 @@ class MainWindow(QMainWindow):
         elif operation in {"sync", "auto_sync", "verify"}:
             count = len(result) if isinstance(result, list) else 0
             title = "同步完成" if operation in {"sync", "auto_sync"} else "校验完成"
-            supplement_errors = [item for item in result if item.get("dependency_summary", {}).get("state") == "error"] if isinstance(result, list) else []
-            if supplement_errors:
-                title = "原日包已完成，补充包有失败"
-                self._populate_tree(self.catalog)
-                self.task_title.setText(title)
-                self.task_detail.setText(f"{len(supplement_errors)} 个日期的补充包待重试；原日包保留")
-                self.task_progress.setValue(0)
-                self.state_store.event("error", title, "\n".join(
-                    f"{item.get('collector_id')}/{item.get('archive_date')}: {item['dependency_summary'].get('error')}"
-                    for item in supplement_errors))
-                self.floating_window.set_status(title, self.task_detail.text(), 0, "注意")
-                return
             self.task_title.setText(title)
             self.task_detail.setText(f"{count} 个归档日期验证通过")
             self.task_progress.setValue(1000)
@@ -2046,8 +2005,7 @@ class MainWindow(QMainWindow):
                     )
                     item.setToolTip(1, day.remote_detail)
                     item.setToolTip(5, day.local_detail)
-                    item.setToolTip(6, self._archive_summary_detail(day) + "\n" +
-                        summary_label(day.dependency_summary) + "\n" + str(day.dependency_summary.get("error", "")))
+                    item.setToolTip(6, self._archive_summary_detail(day))
                     self._tree_day_items[day.key] = item
                     if day.manifest_raw or day.objects:
                         placeholder = QTreeWidgetItem(item, ["展开查看文件"])
@@ -2154,7 +2112,7 @@ class MainWindow(QMainWindow):
     def _update_summary(self) -> None:
         ready = [day for day in self.catalog.days if day.eligible]
         verified = [day for day in self.catalog.days if day.local_status == "verified"]
-        pending = sum(pending_transfer_bytes(day) for day in ready)
+        pending = sum(max(0, day.bytes_total - day.bytes_local) for day in ready)
         self.ready_label.setText(str(len(ready)))
         self.pending_label.setText(bytes_text(pending))
         self.verified_label.setText(str(len(verified)))

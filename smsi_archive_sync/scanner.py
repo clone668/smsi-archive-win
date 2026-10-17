@@ -19,8 +19,6 @@ from .protocol import (
     progress_stage_label,
 )
 from .remote import RemoteArchiveClient, safe_remote_path
-from .dependencies import DependencyReceiver
-from .dependency_source import DependencySource
 
 
 COLLECTOR_RE = re.compile(r"^collector=([A-Za-z0-9][A-Za-z0-9._-]{0,63})$")
@@ -249,12 +247,9 @@ def scan_catalog(
         if (match := COLLECTOR_RE.fullmatch(name))
     ]
     date_pairs: list[tuple[str, str]] = []
-    dependency_nodes: set[str] = set()
     for collector_id in collectors:
         collector_path = safe_remote_path(root, f"collector={collector_id}")
         for name in client.list_directories(collector_path):
-            if name == "dependencies-v1":
-                dependency_nodes.add(collector_id)
             match = DATE_RE.fullmatch(name)
             if match:
                 date_pairs.append((collector_id, match.group(1)))
@@ -386,28 +381,6 @@ def scan_catalog(
             progress(f"扫描 {collector_id}/date={archive_date}", index, total)
     known = {day.key for day in days}
     days.extend(_local_only_days(config, known))
-    for collector_id in collectors:
-        receiver = DependencyReceiver(config.local_path / f"collector={collector_id}", collector_id,
-            DependencySource(client, root, collector_id), require_upstream_receipt=True)
-        try:
-            local_deliveries = config.local_path / f"collector={collector_id}" / "dependencies-v1/deliveries"
-            entries = receiver.discover() if collector_id in dependency_nodes or local_deliveries.is_dir() else {}
-            error = ""
-        except Exception as exc:
-            entries, error = {}, str(exc)
-        for day in (value for value in days if value.collector_id == collector_id):
-            try:
-                if error:
-                    raise RuntimeError(error)
-                entry = entries.get((day.archive_date, day.manifest_sha256))
-                if entry:
-                    day.dependency_summary = receiver.inspect(entry)
-                elif any(identity[0] == day.archive_date for identity in entries):
-                    raise RuntimeError("补充包与原日包版本不匹配")
-                else:
-                    day.dependency_summary = {"state": "unpublished"}
-            except Exception as exc:
-                day.dependency_summary = {"state": "error", "error": str(exc)}
     days.sort(key=lambda item: (item.collector_id.casefold(), item.archive_date), reverse=False)
     return ArchiveCatalog(
         scanned_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),

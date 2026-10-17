@@ -69,33 +69,6 @@ def test_main_window_renders(tmp_path) -> None:
     window.close()
 
 
-def test_supplement_progress_and_failure_do_not_change_native_state(tmp_path) -> None:
-    app = QApplication.instance() or QApplication([])
-    window = MainWindow(ConfigStore(tmp_path / "config"), StateStore(tmp_path / "state"), QIcon())
-    day = ArchiveDay(collector_id="tencent-paper", archive_date="2026-10-12",
-        remote_status="ready", local_status="verified", bytes_total=100, bytes_local=100,
-        dependency_summary={"state": "verified", "dependency_status": "partial"})
-    window.catalog = ArchiveCatalog(days=[day])
-    window._populate_tree(window.catalog)
-    assert window._tree_day_items[day.key].text(6).startswith("补包已验证 · 材料缺项")
-    assert "材料仍有缺项" in window._tree_day_items[day.key].toolTip(6)
-    day.dependency_summary = {"state": "ready", "catalog_key": "test", "bytes_total": 1024}
-    window._update_summary()
-    assert window.pending_label.text() == "1.0 KiB"
-    window._on_progress({"phase": "supplement", "collector_id": day.collector_id,
-        "archive_date": day.archive_date, "bytes_done": 10, "bytes_total": 20})
-    assert window.task_progress.value() == 500
-    assert day.local_status == "verified" and day.bytes_local == 100
-    day.dependency_summary = {"state": "error", "error": "supplement transfer failed"}
-    window._on_operation_done("auto_sync", [{"collector_id": day.collector_id,
-        "archive_date": day.archive_date, "dependency_summary": day.dependency_summary}])
-    assert "补充包有失败" in window.task_title.text()
-    assert "supplement transfer failed" in window._tree_day_items[day.key].toolTip(6)
-    assert day.local_status == "verified"
-    window._exit_requested = True
-    window.close()
-
-
 def test_timestamp_text_removes_subseconds() -> None:
     assert timestamp_text("2026-08-10T13:50:37.923839Z") == (
         "2026-08-10 13:50:37 UTC"

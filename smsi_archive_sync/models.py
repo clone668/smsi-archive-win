@@ -126,7 +126,6 @@ class ArchiveDay:
     bytes_local: int = 0
     objects: list[RemoteObject] = field(default_factory=list)
     summary: ArchiveSummary = field(default_factory=ArchiveSummary)
-    dependency_summary: dict[str, Any] = field(default_factory=dict)
 
     @property
     def key(self) -> str:
@@ -134,16 +133,11 @@ class ArchiveDay:
 
     @property
     def eligible(self) -> bool:
-        return self.remote_status == "ready" and (self.local_status in {
+        return self.remote_status == "ready" and self.local_status in {
             "missing",
             "partial",
             "metadata_update",
-        } or (self.local_status == "verified" and self.dependency_pending))
-
-    @property
-    def dependency_pending(self) -> bool:
-        return self.dependency_summary.get("state") in {"ready", "cancelled"} and bool(
-            self.dependency_summary.get("catalog_key"))
+        }
 
     @property
     def manifest_raw(self) -> bytes:
@@ -158,6 +152,8 @@ class ArchiveDay:
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "ArchiveDay":
         payload = dict(value)
+        # Accept 1.12.0 caches without scheduling retired supplement transfers.
+        payload.pop("dependency_summary", None)
         payload["objects"] = [
             RemoteObject(**dict(item))
             for item in value.get("objects") or []
